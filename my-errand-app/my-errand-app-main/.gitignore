@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.env.production
+
+# Build outputs
+dist/
+client/dist/
+build/
+www/
+
+# Cordova
+platforms/
+plugins/
+
+# Uploads & local data
+uploads/
+mariadb_data/
+
+# Logs / OS
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.apk
+*.aab
