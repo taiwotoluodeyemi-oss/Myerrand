@@ -2,11 +2,10 @@
 node_modules/
 client/node_modules/
 
-# Env / secrets
+# Env / secrets (never commit real secrets)
 .env
-.env.local
-.env.*.local
-*.env.production
+.env.*
+!.env.example
 
 # Build outputs
 dist/
