@@ -1,0 +1,117 @@
+# Build a debug Android APK in the cloud — no PC required.
+# After a successful run: Actions → this workflow → Artifacts → download my-errand-app-debug.apk
+#
+# Optional: set repo secret MOBILE_API_BASE to your live API URL (https://...).
+
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_base:
+        description: 'Backend API base URL for the app (https://...)'
+        required: false
+        default: ''
+  push:
+    branches: [main, master]
+    paths:
+      - 'client/**'
+      - 'config.xml'
+      - 'package.json'
+      - 'scripts/prepare-cordova.js'
+      - '.github/workflows/build-apk.yml'
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Install Android packages
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Install client dependencies
+        run: npm run install-client
+
+      - name: Install Cordova CLI + plugins deps
+        run: npm install -g cordova@12
+
+      - name: Resolve API base URL
+        id: api
+        run: |
+          API="${{ github.event.inputs.api_base }}"
+          if [ -z "$API" ]; then
+            API="${{ secrets.MOBILE_API_BASE }}"
+          fi
+          if [ -z "$API" ]; then
+            API=""
+            echo "WARNING: No API_BASE set. App will use empty base (configure later or re-run with input)."
+          fi
+          echo "base=$API" >> "$GITHUB_OUTPUT"
+          echo "Using API_BASE=$API"
+
+      - name: Build web assets for Cordova
+        env:
+          CORDOVA: 'true'
+          API_BASE: ${{ steps.api.outputs.base }}
+          MOBILE_API_BASE: ${{ steps.api.outputs.base }}
+        run: |
+          cd client && CORDOVA=true API_BASE="$API_BASE" npm run build && cd ..
+          API_BASE="$API_BASE" MOBILE_API_BASE="$MOBILE_API_BASE" node scripts/prepare-cordova.js
+
+      - name: Add Android platform
+        run: |
+          npx cordova platform add android@13 || npx cordova platform add android
+          npx cordova prepare android
+
+      - name: Build debug APK
+        run: npx cordova build android --debug
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK=$(find platforms/android -name "*.apk" | head -n 1)
+          echo "Found: $APK"
+          if [ -z "$APK" ]; then
+            echo "No APK found"
+            find platforms/android -type f -name "*.apk" -o -name "*.aab" || true
+            exit 1
+          fi
+          cp "$APK" my-errand-app-debug.apk
+          ls -lh my-errand-app-debug.apk
+          echo "path=my-errand-app-debug.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-errand-app-debug-apk
+          path: my-errand-app-debug.apk
+          retention-days: 14
