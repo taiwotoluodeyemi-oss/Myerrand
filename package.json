@@ -32,7 +32,8 @@
     "cordova:run": "npm run build:cordova && cordova run android",
     "apk": "npm run cordova:build:android",
     "international": "node scripts/auto-international.js",
-    "align-db": "node scripts/apply-qa-alignment.js"
+    "align-db": "node scripts/apply-qa-alignment.js",
+    "fix-budget-column": "node scripts/fix-max-budget-column.js"
   },
   "keywords": [],
   "author": "",
