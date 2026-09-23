@@ -1,0 +1,26 @@
+{
+  "name": "My Errand App",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "forwardPorts": [5000, 3001, 3306],
+  "portsAttributes": {
+    "5000": { "label": "API", "onAutoForward": "notify" },
+    "3001": { "label": "Client", "onAutoForward": "openBrowser" },
+    "3306": { "label": "MariaDB", "onAutoForward": "silent" }
+  },
+  "postCreateCommand": "npm run setup",
+  "postStartCommand": "npm run db:start || true",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
+      ]
+    }
+  },
+  "remoteEnv": {
+    "USE_MONGO": "false"
+  }
+}
