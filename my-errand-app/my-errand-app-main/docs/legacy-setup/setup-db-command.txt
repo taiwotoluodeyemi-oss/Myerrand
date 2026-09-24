@@ -1,0 +1,17 @@
+// Manual database setup commands for XAMPP
+
+1. Open Command Prompt or PowerShell as Administrator
+
+2. Navigate to your project directory:
+   cd "C:\xampp\htdocs\my-errand-app"
+
+3. Run the following command to execute the schema:
+   C:\xampp\mysql\bin\mysql.exe -u root < database\schema.sql
+
+   OR if you have a password for root:
+   C:\xampp\mysql\bin\mysql.exe -u root -p < database\schema.sql
+
+4. If the above doesn't work, try this alternative:
+   C:\xampp\mysql\bin\mysql.exe -u root -e "source database/schema.sql"
+
+Note: Make sure XAMPP MySQL service is running before executing these commands!
