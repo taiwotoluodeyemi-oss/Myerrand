@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+node_modules/
+build/
+dist/
+*.log
+*.zip
+.DS_Store
+env-copy.txt
+HOW_TO_FIND_ENV.txt
