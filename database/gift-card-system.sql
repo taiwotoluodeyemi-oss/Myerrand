@@ -45,5 +45,5 @@ CREATE TABLE IF NOT EXISTS gift_cards (
 ALTER TABLE wallet_transactions
   MODIFY COLUMN transaction_type ENUM(
     'deposit', 'withdrawal', 'transfer', 'earning', 'payment', 'refund',
-    'fee', 'conversion', 'gift_card_issue', 'gift_card_redeem'
+    'fee', 'conversion', 'gift_card_issue', 'gift_card_redeem', 'escrow_hold', 'escrow_release'
   ) NOT NULL;
