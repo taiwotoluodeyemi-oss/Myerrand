@@ -10,7 +10,7 @@ const setupWalletSystem = async () => {
       host: process.env.MYSQL_HOST || process.env.DB_HOST || 'localhost',
       user: process.env.MYSQL_USER || process.env.DB_USER || 'root',
       password: process.env.MYSQL_PASSWORD || process.env.DB_PASSWORD || '',
-      database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'errandsplace'
+      database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'defaultdb'
     });
 
     console.log('Connected to database');

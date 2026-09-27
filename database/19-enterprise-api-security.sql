@@ -1,5 +1,4 @@
 -- P8 enterprise/API production security hardening. Additive only.
-USE errandsplace;
 
 ALTER TABLE organization_api_keys
   ADD COLUMN IF NOT EXISTS expires_at DATETIME NULL,

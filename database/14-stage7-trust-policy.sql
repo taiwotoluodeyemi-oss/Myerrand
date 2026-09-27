@@ -1,5 +1,4 @@
 -- Stage 7: verification gate, policy versioning, liability acknowledgement, trust analytics.
-USE errandsplace;
 
 ALTER TABLE runners ADD COLUMN verification_status ENUM('pending','approved','rejected') NOT NULL DEFAULT 'pending';
 ALTER TABLE runners ADD COLUMN verification_updated_at TIMESTAMP NULL;

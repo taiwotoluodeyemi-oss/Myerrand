@@ -1,6 +1,5 @@
 -- My Errand Phase 0-2 money/state migration.
 -- Prefer scripts/apply-money-state.js for safe conditional application.
-USE errandsplace;
 
 ALTER TABLE errands
   MODIFY COLUMN status ENUM('pending','paid','accepted','picked_up','delivered','completed','cancelled','disputed','assigned','in_progress') NOT NULL DEFAULT 'pending';

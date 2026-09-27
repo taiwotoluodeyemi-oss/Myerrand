@@ -54,7 +54,7 @@ async function waitForMysql(maxAttempts = 30) {
     port: parseInt(process.env.MYSQL_PORT || '3306', 10),
     user: process.env.MYSQL_USER || 'errand_user',
     password: process.env.MYSQL_PASSWORD || 'errand_dev_password',
-    database: process.env.MYSQL_DATABASE || 'errandsplace',
+    database: process.env.MYSQL_DATABASE || 'defaultdb',
   };
 
   for (let i = 1; i <= maxAttempts; i++) {

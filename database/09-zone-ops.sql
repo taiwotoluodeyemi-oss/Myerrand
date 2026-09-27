@@ -1,5 +1,4 @@
 -- My Errand Stage 2: one-zone operating model. Additive only.
-USE errandsplace;
 
 ALTER TABLE errands ADD COLUMN country VARCHAR(100) NULL;
 ALTER TABLE errands ADD COLUMN city VARCHAR(100) NULL;

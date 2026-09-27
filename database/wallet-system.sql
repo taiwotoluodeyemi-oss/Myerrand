@@ -1,7 +1,6 @@
 -- Enhanced Wallet System for My Errand App
 -- This script adds wallet functionality with spendable and withdrawable accounts
 
-USE errandsplace;
 
 -- =======================
 -- WALLETS TABLE (Multi-currency wallet system)

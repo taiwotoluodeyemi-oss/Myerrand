@@ -1,6 +1,5 @@
 -- P9: production-safe asynchronous webhook/notification operations.
 -- Additive migration; webhook delivery is strictly outside money/state transactions.
-USE errandsplace;
 
 ALTER TABLE webhook_subscriptions
   ADD COLUMN IF NOT EXISTS previous_secret_ciphertext TEXT NULL,

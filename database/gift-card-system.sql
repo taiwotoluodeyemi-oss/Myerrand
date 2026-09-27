@@ -4,7 +4,6 @@
 -- Run this after wallet-system.sql (it depends on the `wallets`, `wallet_transactions`
 -- and `users` tables already existing).
 
-USE errandsplace;
 
 -- =======================
 -- GIFT_CARDS TABLE

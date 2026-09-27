@@ -1,5 +1,4 @@
 -- Stage 8: enterprise organizations, API keys, sandbox, business receipts, provider modes.
-USE errandsplace;
 
 CREATE TABLE IF NOT EXISTS organizations (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -16,7 +15,7 @@ CREATE TABLE IF NOT EXISTS organizations (
 CREATE TABLE IF NOT EXISTS organization_members (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   organization_id BIGINT NOT NULL,
-  user_id BIGINT NOT NULL,
+  user_id INT NOT NULL,
   role ENUM('owner','dispatcher') NOT NULL DEFAULT 'dispatcher',
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE KEY uq_org_member (organization_id,user_id),

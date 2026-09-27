@@ -1,5 +1,4 @@
 -- P8 authentication/account-security hardening. Additive only.
-USE errandsplace;
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_version INT NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at DATETIME NULL;

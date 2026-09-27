@@ -37,6 +37,7 @@
     "db:zone": "node scripts/apply-zone-ops.js",
     "db:city": "node scripts/apply-city-scale.js",
     "db:stage5": "node scripts/apply-stage5.js",
+    "db:stage4": "node scripts/apply-stage4-manual.js",
     "db:stage6": "node scripts/apply-stage6.js",
     "test:stage6": "node --test tests/stage6.test.js tests/stage5.test.js tests/money-engine.test.js",
     "db:stage7": "node scripts/apply-stage7.js",

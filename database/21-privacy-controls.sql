@@ -1,5 +1,4 @@
 -- P11 privacy/compliance operations. Operational controls only; not a legal-compliance certification.
-USE errandsplace;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS deactivated_at DATETIME NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS anonymized_at DATETIME NULL;
 ALTER TABLE runners ADD COLUMN IF NOT EXISTS anonymized_at DATETIME NULL;

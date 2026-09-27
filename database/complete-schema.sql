@@ -1,7 +1,6 @@
 -- Complete Database Schema for My Errand App
 -- This script creates all necessary tables for the errand application
 
-USE errandsplace;
 
 -- =======================
 -- USERS TABLE (Base table for all users)

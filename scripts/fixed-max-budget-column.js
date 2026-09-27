@@ -14,7 +14,7 @@ function buildSsl() {
 }
 
 async function main(){
-  const connection=await mysql.createConnection({host:process.env.MYSQL_HOST||process.env.DB_HOST||'localhost',port:Number(process.env.MYSQL_PORT||process.env.DB_PORT||3306),user:process.env.MYSQL_USER||process.env.DB_USER||'root',password:process.env.MYSQL_PASSWORD||process.env.DB_PASSWORD||'',database:process.env.MYSQL_DATABASE||process.env.DB_NAME||'errandsplace',ssl:buildSsl(),connectTimeout:20000});
+  const connection=await mysql.createConnection({host:process.env.MYSQL_HOST||process.env.DB_HOST||'localhost',port:Number(process.env.MYSQL_PORT||process.env.DB_PORT||3306),user:process.env.MYSQL_USER||process.env.DB_USER||'root',password:process.env.MYSQL_PASSWORD||process.env.DB_PASSWORD||'',database:process.env.MYSQL_DATABASE||process.env.DB_NAME||'defaultdb',ssl:buildSsl(),connectTimeout:20000});
   try{
     const [cols]=await connection.query(`SELECT COLUMN_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='clients' AND COLUMN_NAME='max_budget_per_errand'`);
     if(!cols.length){console.log('[fix-column] Column not found; nothing to do.');return;}

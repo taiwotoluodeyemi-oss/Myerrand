@@ -62,7 +62,7 @@ function main() {
     MYSQL_PORT: '3306',
     MYSQL_USER: 'errand_user',
     MYSQL_PASSWORD: 'errand_dev_password',
-    MYSQL_DATABASE: 'errandsplace',
+    MYSQL_DATABASE: 'defaultdb',
     MYSQL_ROOT_PASSWORD: 'root_dev_password',
     JWT_EXPIRY: '7d',
     CLIENT_URL: 'http://localhost:3001',

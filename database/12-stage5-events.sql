@@ -1,6 +1,5 @@
 -- My Errand Stage 5: webhook outbox, webhook subscriptions/deliveries, and event-linked notifications.
 -- Additive only. Run after database/11-stage4-market-merchant.sql.
-USE errandsplace;
 
 CREATE TABLE IF NOT EXISTS webhook_subscriptions (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,

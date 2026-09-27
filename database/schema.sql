@@ -2,7 +2,6 @@
 -- Drop existing database and create fresh one
 DROP DATABASE IF EXISTS errandsplace;
 CREATE DATABASE errandsplace;
-USE errandsplace;
 
 -- Users table
 CREATE TABLE users (

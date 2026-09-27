@@ -1,5 +1,4 @@
 -- Financial integrity / concurrency hardening. Additive only.
-USE errandsplace;
 
 CREATE TABLE IF NOT EXISTS financial_operations (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,

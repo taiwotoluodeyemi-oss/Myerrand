@@ -1,5 +1,4 @@
 -- Stage 6: notifier providers, payment disputes, growth credits, waitlist, SLA incidents.
-USE errandsplace;
 
 ALTER TABLE wallet_transactions
   MODIFY COLUMN transaction_type ENUM('deposit','withdrawal','transfer','earning','payment','refund','fee','conversion','escrow_hold','escrow_release','gift_card_issue','gift_card_redeem','referral_bonus','promo_credit','platform_loss') NOT NULL;
@@ -124,4 +123,4 @@ CREATE TABLE IF NOT EXISTS market_sla_targets (
   CONSTRAINT fk_sla_target_market FOREIGN KEY (market_id) REFERENCES markets(id) ON DELETE CASCADE
 );
 
-INSERT IGNORE INTO market_sla_targets (market_id) SELECT id,20,0.85,0.05 FROM markets;
+INSERT IGNORE INTO market_sla_targets (market_id, target_accept_minutes, target_completion_rate, target_dispute_rate_max) SELECT id,20,0.85,0.05 FROM markets;

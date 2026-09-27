@@ -95,7 +95,7 @@ async function setupDatabase() {
 
     // Create database if it doesn't exist (skip on managed DBs like Aiven where you may lack CREATE DATABASE)
     try {
-      await connection.execute(`CREATE DATABASE IF NOT EXISTS \`${process.env.MYSQL_DATABASE || process.env.DB_NAME || 'errandsplace'}\``);
+      await connection.execute(`CREATE DATABASE IF NOT EXISTS \`${process.env.MYSQL_DATABASE || process.env.DB_NAME || 'defaultdb'}\``);
       console.log('📊 Database created/verified');
     } catch (e) {
       console.warn('⚠️ Could not CREATE DATABASE (normal on Aiven):', e.message);
@@ -106,7 +106,7 @@ async function setupDatabase() {
     
     connection = await mysql.createConnection({
       ...baseOpts,
-      database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'errandsplace',
+      database: process.env.MYSQL_DATABASE || process.env.DB_NAME || 'defaultdb',
     });
 
     // Read and execute the schema file

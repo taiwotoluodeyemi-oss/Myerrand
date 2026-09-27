@@ -1,5 +1,4 @@
 -- My Errand Stage 3: multi-zone operating control. Additive only.
-USE errandsplace;
 
 CREATE TABLE IF NOT EXISTS market_zones (
   id INT AUTO_INCREMENT PRIMARY KEY,

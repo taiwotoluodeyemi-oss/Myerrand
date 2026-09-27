@@ -63,7 +63,7 @@ async function main() {
       port: parseInt(process.env.MYSQL_PORT || '3306', 10),
       user: process.env.MYSQL_USER || 'errand_user',
       password: process.env.MYSQL_PASSWORD || 'errand_dev_password',
-      database: process.env.MYSQL_DATABASE || 'errandsplace',
+      database: process.env.MYSQL_DATABASE || 'defaultdb',
     });
   } catch (e) {
     console.warn('auto-international: DB not ready —', e.message);

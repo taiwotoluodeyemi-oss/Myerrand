@@ -1,5 +1,4 @@
 -- Admin-only MFA. Additive migration; no existing rows are removed.
-USE errandsplace;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled TINYINT(1) NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret_enc TEXT NULL;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enrolled_at DATETIME NULL;

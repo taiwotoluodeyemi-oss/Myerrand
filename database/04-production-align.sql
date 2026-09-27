@@ -1,5 +1,4 @@
 -- Production alignment: columns expected by routes/errands.routes.js and wallet flows
-USE errandsplace;
 
 -- Allow admin user type
 ALTER TABLE users MODIFY COLUMN user_type ENUM('client', 'runner', 'admin') NOT NULL;

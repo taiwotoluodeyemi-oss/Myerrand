@@ -43,7 +43,7 @@ const pool = mysql.createPool({
   port: parseInt(process.env.MYSQL_PORT, 10) || 3306,
   user: process.env.MYSQL_USER || 'root',
   password: process.env.MYSQL_PASSWORD || '',
-  database: process.env.MYSQL_DATABASE || 'errandsplace',
+  database: process.env.MYSQL_DATABASE || 'defaultdb',
   ssl: buildSslConfig(),
   waitForConnections: true,
   connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT, 10) || 10,
