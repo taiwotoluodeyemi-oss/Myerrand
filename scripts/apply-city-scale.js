@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { pool } = require('../config/db.mysql');
 const { PRIMARY_MARKET } = require('../config/marketplace');
 

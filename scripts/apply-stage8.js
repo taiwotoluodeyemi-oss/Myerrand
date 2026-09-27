@@ -1,2 +1,3 @@
+require('dotenv').config();
 const fs=require('fs'); const path=require('path'); const {pool}=require('../config/db.mysql');
 (async()=>{try{const sql=fs.readFileSync(path.join(__dirname,'../database/15-stage8-enterprise.sql'),'utf8'); for(const stmt of sql.split(/;\s*(?=CREATE|ALTER|UPDATE|USE)/i).map(x=>x.trim()).filter(Boolean)){ if(/^--/.test(stmt) && !/\n(?:CREATE|ALTER|UPDATE|USE)/i.test(stmt)) continue; await pool.query(stmt); } console.log('Stage 8 migration applied'); process.exit(0);}catch(e){console.error('Stage 8 migration failed:',e.message);process.exit(1);}finally{try{await pool.end();}catch{}}})();
