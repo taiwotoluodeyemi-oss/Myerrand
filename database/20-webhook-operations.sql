@@ -2,15 +2,15 @@
 -- Additive migration; webhook delivery is strictly outside money/state transactions.
 
 ALTER TABLE webhook_subscriptions
-  ADD COLUMN IF NOT EXISTS previous_secret_ciphertext TEXT NULL,
-  ADD COLUMN IF NOT EXISTS previous_secret_expires_at TIMESTAMP NULL;
+  ADD COLUMN previous_secret_ciphertext TEXT NULL,
+  ADD COLUMN previous_secret_expires_at TIMESTAMP NULL;
 
 ALTER TABLE webhook_deliveries
-  MODIFY COLUMN status ENUM('pending','processing','delivered','retrying','dead_letter') NOT NULL DEFAULT 'pending',
-  ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP NULL,
-  ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMP NULL;
+  MODIFY COLUMN status ENUM('pending', 'processing', 'delivered', 'retrying', 'dead_letter') NOT NULL DEFAULT 'pending',
+  ADD COLUMN locked_at TIMESTAMP NULL,
+  ADD COLUMN last_attempt_at TIMESTAMP NULL;
 
-CREATE INDEX IF NOT EXISTS idx_webhook_delivery_claim
+CREATE INDEX idx_webhook_delivery_claim
   ON webhook_deliveries(status, next_attempt_at, locked_at);
 
 CREATE TABLE IF NOT EXISTS notification_failures (
@@ -28,5 +28,5 @@ CREATE TABLE IF NOT EXISTS notification_failures (
   INDEX idx_notification_failures_event (event_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_webhook_outbox_unprocessed
+CREATE INDEX idx_webhook_outbox_unprocessed
   ON webhook_outbox(processed_at, created_at);
