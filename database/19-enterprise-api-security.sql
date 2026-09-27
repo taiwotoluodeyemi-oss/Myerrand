@@ -1,8 +1,5 @@
 -- P8 enterprise/API production security hardening. Additive only.
 
-ALTER TABLE organization_api_keys
-  ADD COLUMN revoked_at DATETIME NULL,
-  ADD COLUMN mode ENUM('live','sandbox') NOT NULL DEFAULT 'live';
 
 UPDATE organization_api_keys k
 JOIN organizations o ON o.id=k.organization_id
