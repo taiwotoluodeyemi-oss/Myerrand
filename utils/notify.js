@@ -18,8 +18,8 @@ const { pool } = require('../config/db.mysql');
 async function notifyUser({ userId, errandId = null, title, message, type = 'info' }, io = null) {
   try {
     const [result] = await pool.execute(
-      'INSERT INTO notifications (user_id, errand_id, title, message, body, type) VALUES (?, ?, ?, ?, ?, ?)',
-      [userId, errandId, title, message, message, type]
+      'INSERT INTO notifications (user_id, errand_id, title, message, type) VALUES (?, ?, ?, ?, ?)',
+      [userId, errandId, title, message, type]
     );
 
     const payload = {

@@ -6,6 +6,8 @@ const router = express.Router();
 const { pool } = require('../config/db.mysql');
 const { verifyToken, requireRunner, requireAdmin } = require('../middleware/auth');
 const { notifyUser } = require('../utils/notify');
+const { KycProvider, providerStatus } = require('../services/providers');
+const { auditSecurity } = require('../services/securityAudit');
 
 const jsonResponse = (res, status, success, data = null, error = null) => {
   res.status(status).json({ success, data, error });
@@ -26,10 +28,14 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 },
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
-    const allowed = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
-    cb(null, allowed.includes(file.mimetype));
+    const allowed = {
+      'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/pdf': '.pdf'
+    };
+    const expected = allowed[file.mimetype];
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    cb(null, Boolean(expected && ext === expected));
   }
 });
 
@@ -37,7 +43,7 @@ const upload = multer({
 router.get('/status', verifyToken, requireRunner, async (req, res) => {
   try {
     const [rows] = await pool.execute(
-      'SELECT background_check_status, background_check_date, background_check_notes, identity_verified, id_document_path IS NOT NULL AS has_document FROM runners WHERE user_id = ?',
+      'SELECT verification_status, verification_updated_at, verification_notes, background_check_status, background_check_date, background_check_notes, identity_verified, id_document_path IS NOT NULL AS has_document FROM runners WHERE user_id = ?',
       [req.user.id]
     );
     if (!rows[0]) return jsonResponse(res, 404, false, null, 'Runner profile not found');
@@ -60,7 +66,7 @@ router.post('/submit', verifyToken, requireRunner, upload.single('document'), as
     const relativePath = `/uploads/verification/${req.file.filename}`;
     const [result] = await pool.execute(
       `UPDATE runners
-       SET id_document_path = ?, background_check_status = 'pending', background_check_notes = NULL
+       SET id_document_path = ?, verification_retention_until = DATE_ADD(NOW(), INTERVAL 90 DAY), verification_status = 'pending', verification_updated_at = NOW(), verification_notes = NULL, background_check_status = 'pending', background_check_notes = NULL
        WHERE user_id = ?`,
       [relativePath, req.user.id]
     );
@@ -74,17 +80,24 @@ router.post('/submit', verifyToken, requireRunner, upload.single('document'), as
   }
 });
 
+// Optional vendor adapter. Noop unless KYC_PROVIDER_URL is configured; manual admin review remains authoritative.
+router.get('/provider-status', verifyToken, async (req,res)=>res.json({success:true,provider:KycProvider.mode}));
+router.post('/start', verifyToken, requireRunner, async (req,res)=>{
+  try { const result=await KycProvider.createSession({userId:req.user.id}); res.json({success:true,provider:KycProvider.mode,...result}); }
+  catch(e){res.status(502).json({success:false,error:'KYC provider unavailable'});} });
+
 // --- Admin review ---
 
 // Queue of runners waiting on a decision
 router.get('/admin/pending', verifyToken, requireAdmin, async (req, res) => {
   try {
     const [rows] = await pool.execute(
-      `SELECT r.user_id, r.id_document_path, r.background_check_status, r.updated_at, u.name, u.email
+      `SELECT r.user_id, r.id_document_path, r.verification_status, r.verification_updated_at, r.verification_notes, r.updated_at, u.name, u.email
        FROM runners r JOIN users u ON u.id = r.user_id
-       WHERE r.background_check_status = 'pending' AND r.id_document_path IS NOT NULL
+       WHERE r.verification_status = 'pending' AND r.id_document_path IS NOT NULL
        ORDER BY r.updated_at ASC`
     );
+    await auditSecurity({actorId:req.user.id,action:'sensitive_verification_queue_access',targetType:'verification_queue',targetId:null,details:{rows:rows.length},req});
     jsonResponse(res, 200, true, { runners: rows });
   } catch (error) {
     jsonResponse(res, 500, false, null, error.message);
@@ -95,9 +108,9 @@ router.get('/admin/pending', verifyToken, requireAdmin, async (req, res) => {
 router.get('/admin/all', verifyToken, requireAdmin, async (req, res) => {
   try {
     const [rows] = await pool.execute(
-      `SELECT r.user_id, r.background_check_status, r.identity_verified, r.average_rating, r.total_errands_completed, u.name, u.email
+      `SELECT r.user_id, r.verification_status, r.verification_updated_at, r.verification_notes, r.background_check_status, r.identity_verified, r.average_rating, r.total_errands_completed, u.name, u.email
        FROM runners r JOIN users u ON u.id = r.user_id
-       ORDER BY r.background_check_status = 'pending' DESC, r.updated_at DESC`
+       ORDER BY r.verification_status = 'pending' DESC, r.updated_at DESC`
     );
     jsonResponse(res, 200, true, { runners: rows });
   } catch (error) {
@@ -114,12 +127,15 @@ router.post('/admin/:runner_user_id/decision', verifyToken, requireAdmin, async 
 
     const [result] = await pool.execute(
       `UPDATE runners
-       SET background_check_status = ?,
+       SET verification_status = ?,
+           verification_updated_at = NOW(),
+           verification_notes = ?,
+           background_check_status = ?,
            background_check_date = NOW(),
            background_check_notes = ?,
            identity_verified = ?
        WHERE user_id = ?`,
-      [decision, notes || null, decision === 'approved', req.params.runner_user_id]
+      [decision, notes || null, decision, notes || null, decision === 'approved', req.params.runner_user_id]
     );
     if (result.affectedRows === 0) {
       return jsonResponse(res, 404, false, null, 'Runner not found');
@@ -134,7 +150,8 @@ router.post('/admin/:runner_user_id/decision', verifyToken, requireAdmin, async 
       type: decision === 'approved' ? 'success' : 'warning'
     }, req.app.get('io'));
 
-    jsonResponse(res, 200, true, { message: `Runner ${decision}` });
+    await auditSecurity({actorId:req.user.id,action:'verification_changed',targetType:'runner',targetId:Number(req.params.runner_user_id),details:{decision,notes:notes||null},req});
+    jsonResponse(res, 200, true, { message: `Runner ${decision}`, verification_status: decision });
   } catch (error) {
     jsonResponse(res, 500, false, null, error.message);
   }
@@ -154,6 +171,7 @@ router.get('/admin/document/:runner_user_id', verifyToken, requireAdmin, async (
     // string (see POST /submit above) — never taken from request input —
     // so resolving it against the uploads dir is safe from traversal.
     const absolutePath = path.join(__dirname, '..', docPath);
+    await auditSecurity({actorId:req.user.id,action:'sensitive_verification_document_access',targetType:'runner_verification_document',targetId:Number(req.params.runner_user_id),details:{document_accessed:true},req});
     res.sendFile(absolutePath);
   } catch (error) {
     jsonResponse(res, 500, false, null, error.message);

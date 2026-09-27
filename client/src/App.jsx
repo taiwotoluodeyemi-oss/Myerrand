@@ -146,24 +146,58 @@ function App() {
     setErrands(prev => [...prev, errand])
   }
 
-  const updateErrandStatus = (id, status) => {
-    setErrands(prev => prev.map(errand =>
-      errand.id === id ? { ...errand, status } : errand
-    ))
+  const updateErrandStatus = async (id, status) => {
+    try {
+      const canonical = status === 'in-progress' ? 'picked_up' : status
+      const response = await axios.put(`/api/errands/${id}/status`, { status: canonical, confirm_agreement: true })
+      if (!response.data?.success) throw new Error(response.data?.error || 'Status update failed')
+      await fetchErrands()
+    } catch (error) {
+      console.error('Error updating errand status:', error)
+      alert(error.response?.data?.error || error.message || 'Unable to update errand status')
+    }
   }
 
-  const handleLogout = () => {
-    localStorage.removeItem('token')
-    localStorage.removeItem('user')
-    delete axios.defaults.headers.common['Authorization']
-    setUser(null)
+  const handleLogout = async () => {
+    const token = localStorage.getItem('token')
+    try {
+      if (token) await fetch(apiUrl('/api/auth/logout'), { method: 'POST', headers: { Authorization: `Bearer ${token}` } })
+    } catch (_) {
+      // Local logout still completes if the server is unavailable.
+    } finally {
+      localStorage.removeItem('token')
+      localStorage.removeItem('user')
+      delete axios.defaults.headers.common['Authorization']
+      setUser(null)
+    }
   }
+
+  // Auto logout after 10 minutes of inactivity
+  useEffect(() => {
+    if (!user) return
+    let timeoutId
+    const INACTIVITY_MS = 10 * 60 * 1000 // 10 minutes
+    const resetTimer = () => {
+      clearTimeout(timeoutId)
+      timeoutId = setTimeout(() => {
+        handleLogout()
+        alert('You have been logged out due to 10 minutes of inactivity.')
+      }, INACTIVITY_MS)
+    }
+    const events = ['mousedown', 'mousemove', 'keypress', 'scroll', 'touchstart', 'click']
+    events.forEach(e => window.addEventListener(e, resetTimer))
+    resetTimer()
+    return () => {
+      clearTimeout(timeoutId)
+      events.forEach(e => window.removeEventListener(e, resetTimer))
+    }
+  }, [user])
 
   const getPageTitle = () => {
     switch (location.pathname) {
       case '/': return 'Dashboard'
       case '/errands': return 'My Errands'
-      case '/pay': return 'Payment'
+      case '/pay': return 'Accounts'
       case '/profile': return 'Profile'
       case '/login': return 'Sign In'
       case '/register': return 'Sign Up'
@@ -196,7 +230,7 @@ function App() {
                 <ul>
                   <li><Link to="/" className={location.pathname === '/' ? 'active' : ''}>Home</Link></li>
                   <li><Link to="/errands" className={location.pathname === '/errands' ? 'active' : ''}>Errands</Link></li>
-                  <li><Link to="/pay" className={location.pathname === '/pay' ? 'active' : ''}>Pay Now</Link></li>
+                  <li><Link to="/pay" className={location.pathname === '/pay' ? 'active' : ''}>Accounts</Link></li>
                   <li><Link to="/profile" className={location.pathname === '/profile' ? 'active' : ''}>Profile</Link></li>
                 </ul>
               </nav>
@@ -300,7 +334,7 @@ function App() {
 
         {isAuthenticated && (
           <footer className="app-footer">
-            <p>&copy; 2025 My Errand. All rights reserved. | Built with React & Node.js</p>
+            <p>&copy; 2026 My Errand. All rights reserved. | Built with React & Node.js</p>
           </footer>
         )}
       </div>

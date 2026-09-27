@@ -10,6 +10,7 @@ const { pool } = require('../config/db.mysql');
 const { verifyToken, requireAdmin } = require('../middleware/auth');
 const { getUserWallet, createWallet } = require('../utils/wallet-utils');
 const { notifyUser } = require('../utils/notify');
+const { creditUser, debitUser } = require('../services/financialService');
 
 const CODE_SECRET = () =>
   process.env.GIFT_CODE_SECRET || process.env.JWT_SECRET || 'dev-gift-code-secret';
@@ -66,7 +67,7 @@ router.get('/products', async (req, res) => {
     // Never expose supplier_cost to customers
     res.json({ success: true, products: rows });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: process.env.NODE_ENV === 'production' ? 'Request failed' : e.message });
   }
 });
 
@@ -81,7 +82,7 @@ router.get('/products/:id', async (req, res) => {
     if (!rows.length) return res.status(404).json({ success: false, error: 'Product not found' });
     res.json({ success: true, product: rows[0] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: process.env.NODE_ENV === 'production' ? 'Request failed' : e.message });
   }
 });
 
@@ -167,18 +168,8 @@ router.post('/products/:id/purchase', verifyToken, async (req, res) => {
 
     const balanceBefore = bal;
     const balanceAfter = Math.round((bal - price) * 100) / 100;
-    await connection.execute(
-      `UPDATE wallets SET balance = balance - ?, updated_at = NOW() WHERE id = ? AND balance >= ?`,
-      [price, wallet.id, price]
-    );
-
-    const [txResult] = await connection.execute(
-      `INSERT INTO wallet_transactions
-        (from_wallet_id, transaction_type, amount, currency, description, status, processed_at)
-       VALUES (?, 'gift_card_purchase', ?, 'NGN', ?, 'completed', NOW())`,
-      [wallet.id, price, `Gift card: ${product.product_name} (${product.region})`]
-    );
-    const txId = txResult.insertId;
+    const debitResult = await debitUser({userId, walletType:'spendable', currency:'NGN', amount:price, transactionType:'gift_card_purchase', description:`Gift card: ${product.product_name} (${product.region})`, actorId:userId, reason:`gift_card_purchase:${product.id}`, connection});
+    const txId = debitResult.transactionId;
     const ref = orderRef();
 
     const [orderResult] = await connection.execute(
@@ -234,7 +225,7 @@ router.get('/orders', verifyToken, async (req, res) => {
     );
     res.json({ success: true, orders: rows });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: process.env.NODE_ENV === 'production' ? 'Request failed' : e.message });
   }
 });
 
@@ -270,7 +261,7 @@ router.get('/orders/:id', verifyToken, async (req, res) => {
     }
     res.json({ success: true, order: check[0] });
   } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: process.env.NODE_ENV === 'production' ? 'Request failed' : e.message });
   }
 });
 
@@ -327,39 +318,17 @@ router.post('/orders/:id/cancel', verifyToken, async (req, res) => {
     }
 
     const price = parseFloat(order.price_ngn);
-    let [wallets] = await connection.execute(
-      `SELECT * FROM wallets WHERE user_id = ? AND wallet_type = 'spendable' AND currency = 'NGN' FOR UPDATE`,
-      [userId]
-    );
-    if (!wallets.length) {
-      await connection.execute(
-        `INSERT INTO wallets (user_id, wallet_type, currency, balance, status) VALUES (?, 'spendable', 'NGN', 0, 'active')`,
-        [userId]
-      );
-      [wallets] = await connection.execute(
-        `SELECT * FROM wallets WHERE user_id = ? AND wallet_type = 'spendable' AND currency = 'NGN' FOR UPDATE`,
-        [userId]
-      );
-    }
-    await connection.execute(
-      `UPDATE wallets SET balance = balance + ?, updated_at = NOW() WHERE id = ?`,
-      [price, wallets[0].id]
-    );
-    const [tx] = await connection.execute(
-      `INSERT INTO wallet_transactions
-        (to_wallet_id, transaction_type, amount, currency, description, status, processed_at)
-       VALUES (?, 'refund', ?, 'NGN', ?, 'completed', NOW())`,
-      [wallets[0].id, price, `Refund for cancelled order ${order.order_ref}`]
-    );
+    const refundResult = await creditUser({userId,walletType:'spendable',currency:'NGN',amount:price,transactionType:'refund',description:`Refund for cancelled order ${order.order_ref}`,actorId:userId,reason:`gift_card_refund:${order.id}`,connection});
+    const txId = refundResult.transactionId;
     await connection.execute(
       `UPDATE gift_card_orders SET status = 'refunded', cancelled_at = NOW(), refund_transaction_id = ? WHERE id = ?`,
-      [tx.insertId, order.id]
+      [txId, order.id]
     );
     await connection.commit();
     res.json({ success: true, message: 'Order cancelled and wallet refunded', refunded: price });
   } catch (e) {
     await connection.rollback();
-    res.status(500).json({ success: false, error: e.message });
+    res.status(500).json({ success: false, error: process.env.NODE_ENV === 'production' ? 'Request failed' : e.message });
   } finally {
     connection.release();
   }

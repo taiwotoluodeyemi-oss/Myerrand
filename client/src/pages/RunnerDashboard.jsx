@@ -131,7 +131,8 @@ const RunnerDashboard = ({ user }) => {
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ confirm_agreement: true })
       });
       if (response.data.success) {
         setBalances(response.data.balances);
@@ -177,14 +178,36 @@ const RunnerDashboard = ({ user }) => {
     }
   };
 
-  const acceptErrand = async (errandId) => {
+  const ensureRunnerPolicyAcceptance = async (marketId) => {
+    const mine = await axios.get('/api/policies/mine', { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+    const missing = (mine.data?.missing || []).filter(p => ['terms','privacy','runner_agreement'].includes(p.policy_type));
+    if (missing.length) {
+      const current = await axios.get('/api/policies/current');
+      const labels = missing.map(p => `${p.policy_type} v${p.version}\n${current.data?.policies?.[p.policy_type]?.body || ''}`).join('\n\n');
+      if (!window.confirm(`Please review and accept the current runner policies before accepting:\n\n${labels}`)) return false;
+      for (const item of missing) await axios.post('/api/policies/accept', { policy_type: item.policy_type, version: item.version }, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+    }
+    if (marketId) {
+      const market = await axios.get(`/api/markets/${marketId}`, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+      if (market.data?.market?.insurance_mode === 'ack_only') {
+        if (!window.confirm('This market requires a liability acknowledgement. This acknowledgement does not mean you are insured. Continue?')) return false;
+        await axios.post('/api/policies/liability/ack', { market_id: marketId, version: '2026-09' }, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+      }
+    }
+    return true;
+  };
+
+  const acceptErrand = async (errandId, marketId) => {
+    if (!window.confirm('I agree to the runner terms and understand that payout is released after the delivery window unless there is a dispute.')) return;
     try {
+      if (!(await ensureRunnerPolicyAcceptance(marketId))) return;
       const response = await fetch(apiUrl(`/api/errands/${errandId}/accept`), {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
           'Content-Type': 'application/json'
-        }
+        },
+        body: JSON.stringify({ confirm_agreement: true })
       });
 
       if (response.ok) {
@@ -328,7 +351,9 @@ const RunnerDashboard = ({ user }) => {
   const getStatusColor = (status) => {
     switch (status) {
       case 'pending': return '#ffa500';
+      case 'accepted':
       case 'assigned': return '#2196f3';
+      case 'picked_up':
       case 'in_progress': return '#ff9800';
       case 'completed': return '#4caf50';
       case 'cancelled': return '#f44336';
@@ -479,6 +504,7 @@ const RunnerDashboard = ({ user }) => {
                     <div className="errand-details">
                       <p><strong>Client:</strong> {errand.clientName}</p>
                       <p><strong>Location:</strong> {errand.location}</p>
+                      <p><strong>Zone:</strong> {errand.zone || 'Local zone'}</p>
                       <p><strong>Posted:</strong> {new Date(errand.createdAt).toLocaleDateString()}</p>
                       {errand.deadline && (
                         <p><strong>Deadline:</strong> {new Date(errand.deadline).toLocaleDateString()}</p>
@@ -487,15 +513,32 @@ const RunnerDashboard = ({ user }) => {
                     <div className="errand-actions">
                       <button 
                         className="btn btn-primary"
-                        onClick={() => acceptErrand(errand.id)}
+                        onClick={() => acceptErrand(errand.id, errand.market_id)}
                         disabled={verification && verification.background_check_status !== 'approved'}
                         title={verification && verification.background_check_status !== 'approved' ? 'Your ID must be verified before you can accept errands' : ''}
                       >
                         Accept Errand
                       </button>
-                      <button className="btn btn-outline">
-                        View Details
-                      </button>
+                      {errand.status === 'delivered' && (
+                        <button
+                          className="btn btn-success"
+                          onClick={() => updateErrandStatus(errand.id, 'completed')}
+                        >
+                          Confirm Complete
+                        </button>
+                      )}
+                      {errand.status === 'delivered' && (
+                        <button
+                          className="btn btn-success"
+                          onClick={() => updateErrandStatus(errand.id, 'completed')}
+                        >
+                          Confirm Complete
+                        </button>
+                      )}
+                      <button className="btn btn-outline" onClick={async () => {
+                        const note = window.prompt('Describe the issue'); if (!note) return;
+                        try { await axios.post(`/api/errands/${errand.id}/exception`, { exception_type: 'address_not_found', note }, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } }); toast.info('Exception recorded; dispute opened'); fetchErrands(); } catch (e) { toast.error(e.response?.data?.error || 'Could not record exception'); }
+                      }}>Address issue</button>
                     </div>
                   </div>
                 ))}
@@ -529,13 +572,14 @@ const RunnerDashboard = ({ user }) => {
                       <p><strong>Client:</strong> {errand.clientName}</p>
                       <p><strong>Price:</strong> ${errand.price}</p>
                       <p><strong>Location:</strong> {errand.location}</p>
+                      <p><strong>Zone:</strong> {errand.zone || 'Local zone'}</p>
                       {errand.clientPhone && (
                         <p><strong>Client Phone:</strong> {errand.clientPhone}</p>
                       )}
                       <p><strong>Accepted:</strong> {new Date(errand.acceptedAt).toLocaleDateString()}</p>
                     </div>
 
-                    {['assigned', 'in_progress'].includes(errand.status) && (
+                    {['accepted', 'assigned', 'picked_up', 'in_progress', 'delivered'].includes(errand.status) && (
                       <ChatPanel errandId={errand.id} currentUserId={user?.id} />
                     )}
                     {errand.status === 'completed' && (
@@ -543,15 +587,15 @@ const RunnerDashboard = ({ user }) => {
                     )}
 
                     <div className="errand-actions">
-                      {errand.status === 'assigned' && (
+                      {['accepted', 'assigned'].includes(errand.status) && (
                         <button 
                           className="btn btn-primary"
-                          onClick={() => updateErrandStatus(errand.id, 'in_progress')}
+                          onClick={() => updateErrandStatus(errand.id, 'picked_up')}
                         >
                           Start Errand
                         </button>
                       )}
-                      {errand.status === 'in_progress' && (
+                      {['picked_up', 'in_progress'].includes(errand.status) && (
                         <>
                           <button 
                             className="btn btn-info"
@@ -561,23 +605,16 @@ const RunnerDashboard = ({ user }) => {
                           </button>
                           <button 
                             className="btn btn-success"
-                            onClick={() => updateErrandStatus(errand.id, 'completed')}
+                            onClick={() => updateErrandStatus(errand.id, 'delivered')}
                           >
-                            Mark Complete
+                            Mark Delivered
                           </button>
                         </>
                       )}
-                      <button className="btn btn-outline">
-                        View Details
-                      </button>
-                      {errand.status !== 'completed' && (
-                        <button 
-                          className="btn btn-danger"
-                          onClick={() => updateErrandStatus(errand.id, 'cancelled')}
-                        >
-                          Cancel
-                        </button>
-                      )}
+                      <button className="btn btn-outline" onClick={async () => {
+                        const note = window.prompt('Describe the issue'); if (!note) return;
+                        try { await axios.post(`/api/errands/${errand.id}/exception`, { exception_type: 'address_not_found', note }, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } }); toast.info('Exception recorded; dispute opened'); fetchErrands(); } catch (e) { toast.error(e.response?.data?.error || 'Could not record exception'); }
+                      }}>Address issue</button>
                     </div>
                   </div>
                 ))}
@@ -603,8 +640,9 @@ const RunnerDashboard = ({ user }) => {
                     onChange={(e) => setProgressData({...progressData, status: e.target.value})}
                     className="status-select"
                   >
-                    <option value="assigned">Assigned</option>
-                    <option value="in_progress">In Progress</option>
+                    <option value="accepted">Accepted</option>
+                    <option value="picked_up">Picked Up</option>
+                    <option value="delivered">Delivered</option>
                     <option value="completed">Completed</option>
                   </select>
                 </div>

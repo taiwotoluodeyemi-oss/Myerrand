@@ -22,18 +22,39 @@ const ClientDashboard = ({ user, balances }) => {
     delivery_lng: '',
     mode: 'motorcycle',
     category: 'delivery',
-    urgency: 'medium'
+    urgency: 'medium',
+    channel: 'consumer',
+    zone: '',
+    business_reference: '',
+    contact_phone: '',
+    market_id: ''
   };
   const [newErrand, setNewErrand] = useState(emptyErrand);
   const [quote, setQuote] = useState(null);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState(null);
+  const [zones, setZones] = useState([]);
+  const [markets, setMarkets] = useState([]);
+  const [selectedMarket, setSelectedMarket] = useState(null);
 
   // New state for errand details modal
   const [showDetailsModal, setShowDetailsModal] = useState(false);
   const [selectedErrand, setSelectedErrand] = useState(null);
 
   useEffect(() => {
+    axios.get('/api/markets')
+      .then(response => {
+        const list = response.data?.markets || [];
+        setMarkets(Array.isArray(list) ? list : []);
+        const active = (Array.isArray(list) ? list : []).find(m => m.status !== 'paused') || null;
+        setSelectedMarket(active);
+        if (active) setNewErrand(prev => ({...prev, market_id: active.id, zone: active.zones?.[0] || ''}));
+      }).catch(() => {});
+    axios.get('/api/errands/config/zones', { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } })
+      .then(response => {
+        const list = response.data?.data?.zones || response.data?.zones || [];
+        if (Array.isArray(list)) setZones(list.map(z => typeof z === 'string' ? z : z.zone).filter(Boolean));
+      }).catch(() => {});
     fetchClientErrands();
     // Removed fetchBalances call
     
@@ -44,6 +65,13 @@ const ClientDashboard = ({ user, balances }) => {
 
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    if (!selectedMarket) return;
+    const nextZones = Array.isArray(selectedMarket.zones) ? selectedMarket.zones : [];
+    setZones(nextZones);
+    setNewErrand(prev => ({...prev, market_id: selectedMarket.id, zone: nextZones.includes(prev.zone) ? prev.zone : (nextZones[0] || '')}));
+  }, [selectedMarket]);
 
   // Live quote whenever pickup/delivery/mode/urgency change
   useEffect(() => {
@@ -149,6 +177,10 @@ const ClientDashboard = ({ user, balances }) => {
       toast.error('Please fill in title, pickup and delivery addresses');
       return;
     }
+    if (newErrand.channel === 'business' && (!newErrand.business_reference || !newErrand.contact_phone)) {
+      toast.error('Business errands require a reference and contact phone');
+      return;
+    }
     if (!quote) {
       toast.error('Wait for a price quote before creating the errand');
       return;
@@ -180,8 +212,22 @@ const ClientDashboard = ({ user, balances }) => {
     }
   };
 
+  const ensureClientPolicyAcceptance = async () => {
+    const mine = await axios.get('/api/policies/mine', { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+    const missing = mine.data?.missing || [];
+    if (!missing.length) return true;
+    const current = await axios.get('/api/policies/current');
+    const labels = missing.map(p => `${p.policy_type} v${p.version}\n${current.data?.policies?.[p.policy_type]?.body || ''}`).join('\n\n');
+    if (!window.confirm(`Please review and accept the current policies before paying:\n\n${labels}\n\nBy continuing, you confirm that you have reviewed and accept these current policy versions.`)) return false;
+    for (const item of missing) {
+      await axios.post('/api/policies/accept', { policy_type: item.policy_type, version: item.version }, { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } });
+    }
+    return true;
+  };
+
   const payForErrand = async (errandId, amount) => {
     try {
+      if (!(await ensureClientPolicyAcceptance())) return;
       const response = await axios.post(`/api/errands/pay/${errandId}`, {}, {
         headers: {
           'Authorization': `Bearer ${localStorage.getItem('token')}`,
@@ -274,20 +320,6 @@ const ClientDashboard = ({ user, balances }) => {
         <h1>Client Dashboard</h1>
         <p>Welcome back, {user?.firstName || user?.name || 'Client'}!</p>
         <div className="header-actions">
-          <div className="balance-display">
-            <div className="balance-item">
-              <span className="balance-label">Spendable:</span>
-              <span className="balance-value">${Number(balances.spendable || 0).toFixed(2)}</span>
-            </div>
-            <div className="balance-item">
-              <span className="balance-label">In Escrow:</span>
-              <span className="balance-value">${Number(balances.escrow || 0).toFixed(2)}</span>
-            </div>
-            <div className="balance-item">
-              <span className="balance-label">Withdrawable:</span>
-              <span className="balance-value">${Number(balances.withdrawable || 0).toFixed(2)}</span>
-            </div>
-          </div>
           <button className="btn btn-primary" onClick={createNewErrand}>
             + Create New Errand
           </button>
@@ -436,8 +468,11 @@ const ClientDashboard = ({ user, balances }) => {
                       Pay & Start
                     </button>
                   )}
+                  {errand.status === 'pending' && !errand.payment_status && (
+                    <p className="payment-disclosure" role="note">Funds are held until the delivery window; an open dispute freezes the hold; otherwise funds release to the runner after 24 hours.</p>
+                  )}
                   
-                  {(errand.status === 'pending' || errand.status === 'assigned') && (
+                  {(['paid', 'accepted', 'pending', 'assigned'].includes(errand.status)) && (
                     <button 
                       className="btn btn-danger"
                       onClick={() => cancelErrand(errand.id)}
@@ -446,7 +481,7 @@ const ClientDashboard = ({ user, balances }) => {
                     </button>
                   )}
                   
-                  {errand.status === 'in_progress' && (
+                  {['picked_up', 'in_progress'].includes(errand.status) && (
                     <button 
                       className="btn btn-warning"
                       onClick={() => cancelErrand(errand.id)}
@@ -491,6 +526,37 @@ const ClientDashboard = ({ user, balances }) => {
                   />
                 </div>
                 
+                <div className="form-row">
+                  <div className="form-group">
+                    <label>Market</label>
+                    <select value={newErrand.market_id || ''} onChange={(e) => setSelectedMarket(markets.find(m => m.id === e.target.value) || null)} required>
+                      <option value="">Select market</option>
+                      {markets.filter(m => m.status !== 'paused').map(m => <option key={m.id} value={m.id}>{m.display_name || m.name} ({m.defaultCurrency || m.default_currency}){m.status === 'draft' ? ' — draft' : ''}</option>)}
+                    </select>
+                    {selectedMarket?.status === 'paused' && <small>This market is paused for new demand.</small>}
+                  </div>
+                  <div className="form-group">
+                    <label>Job Type</label>
+                    <select value={newErrand.channel} onChange={(e) => setNewErrand({...newErrand, channel: e.target.value})}>
+                      <option value="consumer">Personal</option>
+                      <option value="business">Business</option>
+                    </select>
+                  </div>
+                  <div className="form-group">
+                    <label>Service Zone * {selectedMarket?.defaultCurrency && <small style={{fontWeight:400}}>Currency: {selectedMarket.defaultCurrency}</small>}</label>
+                    <select value={newErrand.zone} onChange={(e) => setNewErrand({...newErrand, zone: e.target.value})} required>
+                      <option value="">Select zone</option>
+                      {zones.map(zone => <option key={zone} value={zone}>{zone}</option>)}
+                    </select>
+                  </div>
+                </div>
+                {newErrand.channel === 'business' && (
+                  <div className="form-row">
+                    <div className="form-group"><label>Business Reference *</label><input value={newErrand.business_reference} onChange={(e) => setNewErrand({...newErrand, business_reference: e.target.value})} required /></div>
+                    <div className="form-group"><label>Contact Phone *</label><input type="tel" value={newErrand.contact_phone} onChange={(e) => setNewErrand({...newErrand, contact_phone: e.target.value})} required /></div>
+                  </div>
+                )}
+
                 <div className="form-row">
                   <div className="form-group">
                     <label>Pickup Address</label>
@@ -613,6 +679,30 @@ const ClientDashboard = ({ user, balances }) => {
                   </button>
                 </div>
               </form>
+            </div>
+          </div>
+        )}
+
+        {showDetailsModal && selectedErrand && (
+          <div className="modal-overlay" onClick={() => setShowDetailsModal(false)}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header"><h3>{selectedErrand.title}</h3><button className="close-btn" onClick={() => setShowDetailsModal(false)}>×</button></div>
+              <p><strong>Zone:</strong> {selectedErrand.zone || '—'}</p>
+              <p><strong>Type:</strong> {selectedErrand.channel === 'business' ? 'Business' : 'Personal'}</p>
+              {selectedErrand.channel === 'business' && <p><strong>Reference:</strong> {selectedErrand.business_reference || '—'}</p>}
+              <p><strong>Escrow:</strong> {selectedErrand.errand_hold_status || (selectedErrand.payment_status === 'escrowed' ? 'held' : selectedErrand.payment_status || 'not held')}</p>
+              <div style={{ margin: '16px 0' }}>
+                <strong>Timeline</strong>
+                {['paid','accepted','picked_up','delivered','completed'].map((step) => {
+                  const ts = selectedErrand[`${step}_at`];
+                  return <div key={step} style={{ padding: '6px 0' }}>
+                    {ts ? '✓' : '○'} {step.replace('_',' ')} {ts ? `— ${new Date(ts).toLocaleString()}` : ''}
+                  </div>
+                })}
+                {selectedErrand.status === 'disputed' && <div style={{ padding: '6px 0' }}>⚠ disputed — money is frozen</div>}
+                {selectedErrand.cancelled_at && <div style={{ padding: '6px 0' }}>✕ cancelled — {new Date(selectedErrand.cancelled_at).toLocaleString()}</div>}
+              </div>
+              <p style={{ fontSize: 13, color: '#64748b' }}>Funds remain held until the delivery window; an open dispute freezes the hold; otherwise release occurs after 24 hours.</p>
             </div>
           </div>
         )}

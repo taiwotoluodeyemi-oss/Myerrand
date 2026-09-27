@@ -14,6 +14,9 @@ const { getExchangeRate: resolveExchangeRate } = require('../utils/exchange-rate
 const { currencies, getCurrencySymbol } = require('../utils/currencies');
 // Payment provider readiness checks (only allow real payouts once configured)
 const { isPaystackConfigured, isPaypalConfigured, isPaypalPayoutsConfigured } = require('../utils/payment-config');
+const paymentPort = require('../services/paymentPort');
+const { auditSecurity } = require('../services/securityAudit');
+const { creditUser, debitUser, postWalletMutation, transferWallets } = require('../services/financialService');
 
 const PAYPAL_CLIENT = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
@@ -69,7 +72,7 @@ router.get('/currencies', async (req, res) => {
   try {
     res.json({ success: true, currencies });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch currencies', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch currencies', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -80,7 +83,7 @@ router.get('/exchange-rate', async (req, res) => {
     const rate = await getExchangeRate(from.toUpperCase(), to.toUpperCase());
     res.json({ success: true, from: from.toUpperCase(), to: to.toUpperCase(), rate });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch exchange rate', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch exchange rate', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -94,7 +97,7 @@ router.get('/convert', async (req, res) => {
     const converted = amount * rate;
     res.json({ success: true, amount, from, to, rate, converted });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Conversion failed', error: error.message });
+    res.status(500).json({ success: false, message: 'Conversion failed', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -118,7 +121,7 @@ router.get('/wallets', async (req, res) => {
 
     res.json({ success: true, wallets, totalBalance: aggregatedBalance, currency });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch wallets', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch wallets', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -142,235 +145,105 @@ router.get('/balance-summary', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch balance summary', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch balance summary', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
-// =======================
-// DEPOSIT FUNCTIONALITY
-// =======================
+// Stage 4 payment port: all deposits use the same accounting path.
+router.get('/deposit/provider', async (req,res)=>{ res.json({success:true,provider:paymentPort.providerName(),is_demo:paymentPort.providerName()==='demo'}); });
 
-// Create deposit intent (Step 1: Generate payment intent)
-router.post('/deposit/create-intent', async (req, res) => {
-  const { amount, currency = 'USD', paymentMethod = 'paystack', email } = req.body;
-  const userId = req.user.id;
-  const depositAmount = parseFloat(amount);
-
+router.post('/deposit/intent', async (req,res)=>{
   try {
-    if (!depositAmount || depositAmount <= 0) {
-      return res.status(400).json({ success: false, message: 'amount must be greater than 0' });
-    }
-    // Admin-configurable NGN deposit limits when currency is NGN
-    if (String(currency).toUpperCase() === 'NGN') {
-      try {
-        const [srows] = await db.execute(
-          `SELECT setting_key, setting_value FROM platform_settings
-           WHERE setting_key IN ('min_deposit_ngn','max_deposit_ngn')`
-        );
-        const map = {};
-        srows.forEach((r) => { map[r.setting_key] = parseFloat(r.setting_value); });
-        const minD = map.min_deposit_ngn || 1000;
-        const maxD = map.max_deposit_ngn || 1000000;
-        if (depositAmount < minD) {
-          return res.status(400).json({ success: false, message: `Minimum deposit is ₦${minD}` });
-        }
-        if (depositAmount > maxD) {
-          return res.status(400).json({ success: false, message: `Maximum deposit is ₦${maxD}` });
-        }
-      } catch (_) { /* table may not exist yet */ }
-    }
-
-    if (paymentMethod === 'paystack') {
-      // Dev-mode fallback: this server has no real Paystack credentials
-      // configured and isn't running in production, so there's no gateway
-      // to actually charge. Rather than generate a fake authorization_url
-      // and have the frontend do window.location.href = url — a full-page
-      // navigation that does NOT send the Authorization header, so a later
-      // "verify" call on that reference would 401 — we credit the wallet
-      // synchronously, right here, inside this already-authenticated
-      // request. No redirect, no second round trip, nothing to lose the
-      // token. This branch stops being reachable the moment real Paystack
-      // keys are added to .env (isPaystackConfigured() flips true), so it
-      // never runs in a properly configured environment.
-      if (!isPaystackConfigured() && process.env.NODE_ENV !== 'production') {
-        let wallet = await getUserWallet(userId, 'spendable', currency.toUpperCase());
-        if (!wallet) {
-          await createWallet(userId, 'spendable', currency.toUpperCase());
-          wallet = await getUserWallet(userId, 'spendable', currency.toUpperCase());
-        }
-
-        const reference = `dev_dep_${Date.now()}_${userId}`;
-        await db.execute(
-          'UPDATE wallets SET balance = balance + ?, updated_at = NOW() WHERE id = ?',
-          [depositAmount, wallet.id]
-        );
-        await db.execute(
-          `INSERT INTO wallet_transactions (
-            to_wallet_id, transaction_type, amount, currency, description,
-            payment_gateway, gateway_transaction_id, status, processed_at
-          ) VALUES (?, 'deposit', ?, ?, ?, 'dev_mode', ?, 'completed', NOW())`,
-          [wallet.id, depositAmount, currency.toUpperCase(), 'Dev-mode deposit (no Paystack credentials configured)', reference]
-        );
-
-        console.warn(`[DEV MODE] Credited ${depositAmount} ${currency.toUpperCase()} to user ${userId}'s spendable wallet without a real payment — set PAYSTACK_SECRET_KEY / PAYSTACK_PUBLIC_KEY to disable this.`);
-
-        return res.json({
-          success: true,
-          devMode: true,
-          message: `Dev mode: $${depositAmount.toFixed(2)} ${currency.toUpperCase()} added to your spendable wallet (no real payment was made, since Paystack isn't configured on this server).`,
-          reference
-        });
-      }
-
-      // Initialize Paystack transaction
-      const paystackResponse = await axios.post(
-        `${PAYSTACK_BASE_URL}/transaction/initialize`,
-        {
-          email: email || req.user.email,
-          amount: Math.round(depositAmount * 100), // Paystack expects amount in kobo (for NGN)
-          currency: currency.toUpperCase(),
-          reference: `dep_${Date.now()}_${userId}`,
-          callback_url: `${process.env.FRONTEND_URL}/wallet/deposit/callback`,
-          metadata: {
-            user_id: userId,
-            transaction_type: 'deposit'
-          }
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-            'Content-Type': 'application/json'
-          }
-        }
+    const amount=Number(req.body.amount), currency=String(req.body.currency||'NGN').toUpperCase();
+    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:'amount must be greater than 0'});
+    const orgId=req.body.org_id||null;
+    let sandbox=false;
+    if(orgId){
+      const [[membership]]=await db.execute(
+        `SELECT o.id,o.sandbox_flag FROM organizations o
+         JOIN organization_members m ON m.organization_id=o.id
+         WHERE o.id=? AND m.user_id=? LIMIT 1`,
+        [orgId,req.user.id]
       );
-
-      if (paystackResponse.data.status) {
-        res.json({
-          success: true,
-          authorization_url: paystackResponse.data.data.authorization_url,
-          access_code: paystackResponse.data.data.access_code,
-          reference: paystackResponse.data.data.reference
-        });
-      } else {
-        res.status(400).json({ success: false, message: 'Failed to initialize Paystack transaction' });
-      }
-    } else {
-      res.status(400).json({ success: false, message: 'Unsupported payment method' });
+      if(!membership) return res.status(403).json({success:false,message:'Organization access denied'});
+      sandbox=Boolean(membership.sandbox_flag);
     }
-  } catch (error) {
-    console.error('Payment intent creation error:', error.response?.data || error.message);
-    res.status(500).json({ success: false, message: 'Failed to create payment intent', error: error.message });
-  }
+    const sandboxPayment = sandbox ? { is_demo: true } : { is_demo: Boolean(req.body.is_demo) };
+    const result=await paymentPort.initiateDeposit({
+      userId:req.user.id,amount,currency,email:req.body.email||req.user.email,orgId,
+      ...sandboxPayment,idempotencyKey:req.get('Idempotency-Key')||null
+    });
+    const [[disclosure]] = await db.execute(`SELECT version,body FROM policy_versions WHERE policy_type='escrow_disclosure' AND active=TRUE ORDER BY created_at DESC LIMIT 1`);
+    await auditSecurity({actorId:req.user.id,action:'deposit_intent_created',targetType:'organization',targetId:orgId,details:{sandbox,is_demo:Boolean(result.is_demo)},req});
+    res.json({success:true,escrow_disclosure:disclosure?{version:disclosure.version,body:disclosure.body}:null,...result});
+
+  } catch(e){ console.error('payment port initiate',e.message); res.status(e.status||500).json({success:false,message:e.status?e.message:'Failed to create deposit'}); }
 });
 
-// Paystack webhook handler
-router.post('/paystack/webhook', async (req, res) => {
-  if (!PAYSTACK_SECRET_KEY) {
-    return res.status(503).send('Paystack not configured');
-  }
-  const hash = crypto
-    .createHmac('sha512', PAYSTACK_SECRET_KEY)
-    .update(JSON.stringify(req.body))
-    .digest('hex');
-  if (hash !== req.headers['x-paystack-signature']) {
-    console.warn('Paystack webhook: invalid signature');
-    return res.status(401).send('Invalid signature');
-  }
-
-  const event = req.body;
-  if (event && event.event === 'charge.success') {
-    const { reference, amount, currency } = event.data || {};
-    const referenceMatch = reference && String(reference).match(/dep_(\d+)_(\d+)/);
-    if (referenceMatch) {
-      const userId = parseInt(referenceMatch[2], 10);
-      const finalAmount = amount / 100;
-      try {
-        let wallet = await getUserWallet(userId, 'spendable', currency);
-        if (!wallet) {
-          await createWallet(userId, 'spendable', currency);
-          wallet = await getUserWallet(userId, 'spendable', currency);
-        }
-        await db.execute('UPDATE wallets SET balance = balance + ? WHERE id = ?', [finalAmount, wallet.id]);
-        await db.execute(
-          `INSERT INTO wallet_transactions (
-            to_wallet_id, transaction_type, amount, currency, description,
-            payment_gateway, gateway_transaction_id, status, processed_at
-          ) VALUES (?, 'deposit', ?, ?, ?, 'paystack', ?, 'completed', NOW())`,
-          [wallet.id, finalAmount, currency, 'Deposit via Paystack', reference]
-        );
-        console.log(`Paystack deposit processed: ${finalAmount} ${currency} for user ${userId}`);
-      } catch (error) {
-        console.error('Error processing Paystack deposit:', error);
-      }
+// Backwards-compatible endpoint; still goes through the payment port.
+router.post('/deposit/create-intent', async (req,res) => {
+  try {
+    const amount=Number(req.body.amount), currency=String(req.body.currency||'USD').toUpperCase();
+    if(!Number.isFinite(amount)||amount<=0) return res.status(400).json({success:false,message:'amount must be greater than zero'});
+    if(req.body.paymentMethod && req.body.paymentMethod!=='paystack') return res.status(400).json({success:false,message:'Unsupported payment method'});
+    const orgId=req.body.org_id||null;
+    let sandbox=false;
+    if(orgId){
+      const [[membership]]=await db.execute(
+        `SELECT o.id,o.sandbox_flag FROM organizations o
+         JOIN organization_members m ON m.organization_id=o.id
+         WHERE o.id=? AND m.user_id=? LIMIT 1`,
+        [orgId,req.user.id]
+      );
+      if(!membership) return res.status(403).json({success:false,message:'Organization access denied'});
+      sandbox=Boolean(membership.sandbox_flag);
     }
+    const sandboxPayment = sandbox ? { is_demo: true } : { is_demo: Boolean(req.body.is_demo) };
+    const result=await paymentPort.initiateDeposit({
+      userId:req.user.id,amount,currency,email:req.body.email||req.user.email,orgId,
+      ...sandboxPayment,idempotencyKey:req.get('Idempotency-Key')||null
+    });
+    await auditSecurity({actorId:req.user.id,action:'deposit_intent_created',targetType:'organization',targetId:orgId,details:{sandbox,is_demo:Boolean(result.is_demo)},req});
+    res.json({success:true,...result});
+  } catch(e){ console.error('Payment intent creation error:',e.message); res.status(e.status||500).json({success:false,message:e.status?e.message:'Failed to create payment intent'}); }
+});
+
+router.post('/deposit/verify', async (req,res)=>{
+  try {
+    const reference=String(req.body.reference||'').trim();
+    if(!reference) return res.status(400).json({success:false,message:'reference is required'});
+    const [[intent]]=await db.execute('SELECT user_id FROM payment_intents WHERE reference=?',[reference]);
+    if(!intent || Number(intent.user_id)!==Number(req.user.id)) return res.status(403).json({success:false,message:'Payment reference does not belong to this account'});
+    res.json({success:true,...await paymentPort.verify(reference)});
+  } catch(e){ res.status(e.status||500).json({success:false,message:e.status?e.message:'Payment verification failed'}); }
+});
+
+// Paystack webhook: authentication is signature-based; accounting is delegated to
+// the idempotent payment port so webhook + verify races cannot double-credit.
+router.post('/paystack/webhook', async (req, res) => {
+  if (!PAYSTACK_SECRET_KEY) return res.status(503).send('Paystack not configured');
+  const hash=crypto.createHmac('sha512',PAYSTACK_SECRET_KEY).update(JSON.stringify(req.body)).digest('hex');
+  if(hash!==req.headers['x-paystack-signature']) return res.status(401).send('Invalid signature');
+  const event=req.body;
+  if(event?.event==='charge.success'){
+    const {reference,amount,currency}=event.data||{};
+    try{
+      const [[intent]]=await db.execute('SELECT user_id FROM payment_intents WHERE reference=?',[reference]);
+      if(intent) await paymentPort.completePaystackDeposit({reference,userId:intent.user_id,amount:Number(amount)/100,currency,source:'webhook'});
+    }catch(error){ console.error('Error processing Paystack deposit:',error.message); return res.status(500).send('Retry'); }
   }
   res.status(200).send('OK');
 });
 
-// Verify Paystack transaction
-router.post('/paystack/verify', async (req, res) => {
-  const { reference } = req.body;
-  
+router.post('/paystack/verify', async (req,res) => {
   try {
-    const response = await axios.get(
-      `${PAYSTACK_BASE_URL}/transaction/verify/${reference}`,
-      {
-        headers: {
-          Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`
-        }
-      }
-    );
-    
-    if (response.data.status && response.data.data.status === 'success') {
-      const { amount, currency } = response.data.data;
-      const finalAmount = amount / 100;
-      
-      // Extract user ID from reference
-      const referenceMatch = reference.match(/dep_(\d+)_(\d+)/);
-      if (referenceMatch) {
-        const userId = parseInt(referenceMatch[2]);
-        
-        // Get or create spendable wallet
-        let wallet = await getUserWallet(userId, 'spendable', currency);
-        if (!wallet) {
-          await createWallet(userId, 'spendable', currency);
-          wallet = await getUserWallet(userId, 'spendable', currency);
-        }
-        
-        // Check if transaction already processed
-        const [existingTx] = await db.execute(
-          `SELECT id FROM wallet_transactions WHERE gateway_transaction_id = ? AND payment_gateway ='paystack'`,
-          [reference]
-        );
-        
-        if (existingTx.length === 0) {
-          // Update wallet balance
-          await db.execute(
-            'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-            [finalAmount, wallet.id]
-          );
-          
-          // Record transaction
-          await db.execute(
-            `INSERT INTO wallet_transactions (
-              to_wallet_id, transaction_type, amount, currency, description, 
-              payment_gateway, gateway_transaction_id, status, processed_at
-            ) VALUES (?, 'deposit', ?, ?, ?, 'paystack', ?, 'completed', NOW())`,
-            [wallet.id, finalAmount, currency, 'Deposit via Paystack', reference]
-          );
-        }
-        
-        res.json({ success: true, message: 'Payment verified and processed', amount: finalAmount, currency });
-      } else {
-        res.status(400).json({ success: false, message: 'Invalid transaction reference' });
-      }
-    } else {
-      res.status(400).json({ success: false, message: 'Transaction verification failed' });
-    }
-  } catch (error) {
-    console.error('Paystack verification error:', error.response?.data || error.message);
-    res.status(500).json({ success: false, message: 'Verification failed', error: error.message });
-  }
+    const reference=String(req.body.reference||'').trim();
+    if(!reference) return res.status(400).json({success:false,message:'reference is required'});
+    const [[intent]]=await db.execute('SELECT user_id FROM payment_intents WHERE reference=?',[reference]);
+    if(!intent || Number(intent.user_id)!==Number(req.user.id)) return res.status(403).json({success:false,message:'Payment reference does not belong to this account'});
+    const result=await paymentPort.verify(reference);
+    res.json({success:true,...result,message:'Payment verified and processed'});
+  } catch(error){ console.error('Paystack verification error:',error.message); res.status(error.status||500).json({success:false,message:error.status?error.message:'Verification failed'}); }
 });
 
 // =======================
@@ -386,352 +259,49 @@ router.post('/paystack/verify', async (req, res) => {
 // the original spendable->withdrawable behavior for any old client/tests
 // that don't send it yet.
 router.post('/transfer', async (req, res) => {
-  const {
-    amount,
-    fromCurrency = 'USD',
-    toCurrency = 'USD',
-    direction = 'spendable_to_withdrawable'
-  } = req.body;
-  const userId = req.user.id;
-
-  if (!['spendable_to_withdrawable', 'withdrawable_to_spendable'].includes(direction)) {
-    return res.status(400).json({ success: false, message: 'Invalid transfer direction' });
-  }
-
-  const sourceType = direction === 'spendable_to_withdrawable' ? 'spendable' : 'withdrawable';
-  const destType = direction === 'spendable_to_withdrawable' ? 'withdrawable' : 'spendable';
-
+  const { amount, fromCurrency='USD', toCurrency='USD', direction='spendable_to_withdrawable' } = req.body || {};
+  const userId=req.user.id; const value=Number(amount);
+  if (!Number.isFinite(value) || value<=0) return res.status(400).json({success:false,message:'amount must be greater than 0'});
+  if (!['spendable_to_withdrawable','withdrawable_to_spendable'].includes(direction)) return res.status(400).json({success:false,message:'Invalid transfer direction'});
+  const sourceType=direction==='spendable_to_withdrawable'?'spendable':'withdrawable'; const destType=direction==='spendable_to_withdrawable'?'withdrawable':'spendable';
   try {
-    // Quick unlocked pre-check purely to fail fast on obviously-insufficient
-    // balance before doing an exchange-rate lookup (which may hit a live
-    // API). The authoritative check happens below, on the locked row.
-    const sourceWalletPrecheck = await getUserWallet(userId, sourceType, fromCurrency);
-    if (!sourceWalletPrecheck || sourceWalletPrecheck.balance < amount) {
-      return res.status(400).json({ success: false, message: `Insufficient ${sourceType} balance` });
-    }
-
-    // Get or create destination wallet
-    let destWallet = await getUserWallet(userId, destType, toCurrency);
-    if (!destWallet) {
-      await createWallet(userId, destType, toCurrency);
-      destWallet = await getUserWallet(userId, destType, toCurrency);
-    }
-    
-    // Calculate conversion if needed (done before the DB transaction since
-    // this can call out to a live exchange-rate API — we don't want to hold
-    // a row lock open for that)
-    const exchangeRate = await getExchangeRate(fromCurrency, toCurrency);
-    const convertedAmount = amount * exchangeRate;
-    const conversionFee = fromCurrency !== toCurrency ? amount * 0.01 : 0; // 1% conversion fee
-    const finalAmount = convertedAmount - conversionFee;
-    
-    // Start transaction on a dedicated pooled connection (the pool itself
-    // has no beginTransaction/commit/rollback — only a checked-out
-    // connection does; see getUserWallet-adjacent usages elsewhere in this
-    // file for the same pattern).
-    const connection = await db.getConnection();
-    await connection.beginTransaction();
-
+    const exchangeRate=await getExchangeRate(fromCurrency,toCurrency); const convertedAmount=value*exchangeRate; const conversionFee=String(fromCurrency).toUpperCase()!==String(toCurrency).toUpperCase()?value*0.01:0; const finalAmount=convertedAmount-conversionFee;
+    const connection=await db.getConnection();
     try {
-      // Re-fetch and lock the source wallet row so a concurrent transfer or
-      // withdrawal can't race this balance check
-      const [sourceRows] = await connection.execute(
-        `SELECT * FROM wallets WHERE user_id = ? AND wallet_type = ? AND currency = ? AND status = 'active' FOR UPDATE`,
-        [userId, sourceType, String(fromCurrency).toUpperCase()]
-      );
-      const sourceWallet = sourceRows[0];
-      if (!sourceWallet || parseFloat(sourceWallet.balance) < amount) {
-        await connection.rollback();
-        return res.status(400).json({ success: false, message: `Insufficient ${sourceType} balance` });
-      }
-
-      // Deduct from source wallet
-      await connection.execute(
-        'UPDATE wallets SET balance = balance - ? WHERE id = ?',
-        [amount, sourceWallet.id]
-      );
-
-      console.log(`Transfer: -${amount} ${fromCurrency} from wallet ${sourceWallet.id} (${sourceType}) for user ${userId}`);
-
-      // Add to destination wallet
-      await connection.execute(
-        'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-        [finalAmount, destWallet.id]
-      );
-
-      console.log(`Transfer: +${finalAmount} ${toCurrency} to wallet ${destWallet.id} (${destType}) for user ${userId}`);
-      
-      // Record transfer transaction
-      await connection.execute(
-        `INSERT INTO wallet_transactions (
-          from_wallet_id, to_wallet_id, transaction_type, amount, currency,
-          original_amount, original_currency, exchange_rate, conversion_fee,
-          description, status, processed_at
-        ) VALUES (?, ?, 'transfer', ?, ?, ?, ?, ?, ?, ?, 'completed', NOW())`,
-        [
-          sourceWallet.id, destWallet.id, finalAmount, toCurrency,
-          amount, fromCurrency, exchangeRate, conversionFee,
-          `Transfer from ${sourceType} to ${destType} account`
-        ]
-      );
-      
-      await connection.commit();
-      
-      res.json({ 
-        success: true, 
-        message: 'Transfer successful',
-        transferredAmount: finalAmount,
-        conversionFee,
-        exchangeRate
-      });
-    } catch (error) {
-      await connection.rollback();
-      throw error;
-    } finally {
-      connection.release();
-    }
-  } catch (error) {
-    console.error('Transfer failed:', error);
-    res.status(500).json({ success: false, message: 'Transfer failed', error: error.message });
-  }
+      await connection.beginTransaction();
+      const [[sourceWallet]]=await connection.execute(`SELECT * FROM wallets WHERE user_id=? AND wallet_type=? AND currency=? AND status='active' FOR UPDATE`,[userId,sourceType,String(fromCurrency).toUpperCase()]);
+      if(!sourceWallet || Number(sourceWallet.balance)<value){await connection.rollback();return res.status(400).json({success:false,message:`Insufficient ${sourceType} balance`});}
+      let [[destWallet]]=await connection.execute(`SELECT * FROM wallets WHERE user_id=? AND wallet_type=? AND currency=? AND status='active' FOR UPDATE`,[userId,destType,String(toCurrency).toUpperCase()]);
+      if(!destWallet){await connection.execute(`INSERT INTO wallets (user_id,wallet_type,currency,balance,status) VALUES (?,?,?,0,'active')`,[userId,destType,String(toCurrency).toUpperCase()]);[[destWallet]]=await connection.execute(`SELECT * FROM wallets WHERE user_id=? AND wallet_type=? AND currency=? AND status='active' FOR UPDATE`,[userId,destType,String(toCurrency).toUpperCase()]);}
+      await transferWallets({fromWalletId:sourceWallet.id,toWalletId:destWallet.id,fromAmount:value,toAmount:finalAmount,currency:toCurrency,transactionType:'transfer',description:`Transfer from ${sourceType} to ${destType} account`,actorId:userId,reason:'wallet_transfer',originalAmount:value,originalCurrency:fromCurrency,exchangeRate,conversionFee,connection});
+      await connection.commit(); return res.json({success:true,message:'Transfer successful',transferredAmount:finalAmount,conversionFee,exchangeRate});
+    } catch(e){await connection.rollback();throw e;} finally{connection.release();}
+  } catch(e){console.error('Transfer failed:',e.message);res.status(e.status||500).json({success:false,message:e.status?e.message:'Transfer failed'});}
 });
 
 // =======================
 // WITHDRAWAL FUNCTIONALITY
 // =======================
 
-// Get user's withdrawal methods
-router.get('/withdrawal-methods', async (req, res) => {
-  try {
-    const userId = req.user.id;
-    
-    const [methods] = await db.execute(
-      'SELECT id, method_type, method_name, is_verified, is_default FROM withdrawal_methods WHERE user_id = ? AND is_active = 1',
-      [userId]
-    );
-    
-    res.json({ success: true, methods });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch withdrawal methods', error: error.message });
-  }
-});
-
-// Add withdrawal method
-router.post('/withdrawal-methods', async (req, res) => {
-  const { methodType, methodName, accountDetails } = req.body;
-  const userId = req.user.id;
-  
-  try {
-    const [result] = await db.execute(
-      'INSERT INTO withdrawal_methods (user_id, method_type, method_name, account_details) VALUES (?, ?, ?, ?)',
-      [userId, methodType, methodName, JSON.stringify(accountDetails)]
-    );
-    
-    res.json({ success: true, message: 'Withdrawal method added', methodId: result.insertId });
-  } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to add withdrawal method', error: error.message });
-  }
-});
-
-// Process withdrawal
-router.post('/withdraw', async (req, res) => {
-  const { amount, currency = 'USD', withdrawalMethodId } = req.body;
-  const userId = req.user.id;
-
-  // Everything from here on happens inside one held connection: we lock the
-  // withdrawable wallet row BEFORE calling any real payout provider, so two
-  // concurrent withdrawal requests can't both pass the balance check and
-  // both send real money out. The lock is held across the payout call and
-  // only released once the deduction is committed (or the whole thing is
-  // rolled back on failure).
-  let connection;
-  try {
-    connection = await db.getConnection();
-    await connection.beginTransaction();
-
-    const [walletRows] = await connection.execute(
-      `SELECT * FROM wallets WHERE user_id = ? AND wallet_type = 'withdrawable' AND currency = ? AND status = 'active' FOR UPDATE`,
-      [userId, String(currency).toUpperCase()]
-    );
-    const withdrawableWallet = walletRows[0];
-
-    if (!withdrawableWallet || parseFloat(withdrawableWallet.balance) < amount) {
-      await connection.rollback();
-      return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance' });
-    }
-
-    // Get withdrawal method
-    const [method] = await connection.execute(
-      'SELECT * FROM withdrawal_methods WHERE id = ? AND user_id = ? AND is_active = 1',
-      [withdrawalMethodId, userId]
-    );
-
-    if (!method[0]) {
-      await connection.rollback();
-      return res.status(404).json({ success: false, message: 'Withdrawal method not found' });
-    }
-
-    const withdrawalMethod = method[0];
-
-    // Calculate withdrawal fee (example: 2% fee)
-    const withdrawalFee = amount * 0.02;
-    const netAmount = amount - withdrawalFee;
-
-    // Process withdrawal based on method type. Each branch only goes "live"
-    // once the matching provider credentials are set in .env — otherwise we
-    // fail loudly and clearly instead of pretending the payout happened.
-    let withdrawalSuccessful = false;
-    let gatewayTransactionId = null;
-    let accountDetails = {};
-    try {
-      accountDetails = withdrawalMethod.account_details ? JSON.parse(withdrawalMethod.account_details) : {};
-    } catch (e) {
-      accountDetails = {};
-    }
-
-    if (withdrawalMethod.method_type === 'paypal') {
-      if (!isPaypalPayoutsConfigured()) {
-        await connection.rollback();
-        return res.status(503).json({
-          success: false,
-          message: 'PayPal payouts are not set up yet. Add PAYPAL_CLIENT_ID, PAYPAL_SECRET and set PAYPAL_PAYOUTS_ENABLED=true in the server .env to activate this method.'
-        });
-      }
-      if (!accountDetails.email) {
-        await connection.rollback();
-        return res.status(400).json({ success: false, message: 'This PayPal withdrawal method is missing a payout email' });
-      }
-
-      try {
-        const accessToken = await getAccessToken();
-        const payoutResponse = await axios.post(
-          `${BASE_URL}/v1/payments/payouts`,
-          {
-            sender_batch_header: {
-              sender_batch_id: `payout_${userId}_${Date.now()}`,
-              email_subject: 'You have a withdrawal from My Errand'
-            },
-            items: [{
-              recipient_type: 'EMAIL',
-              amount: { value: netAmount.toFixed(2), currency },
-              receiver: accountDetails.email,
-              note: `Withdrawal payout for user ${userId}`
-            }]
-          },
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        withdrawalSuccessful = true;
-        gatewayTransactionId = payoutResponse.data.batch_header?.payout_batch_id || `paypal_${Date.now()}`;
-      } catch (payoutError) {
-        console.error('PayPal payout failed:', payoutError.response?.data || payoutError.message);
-        await connection.rollback();
-        return res.status(502).json({ success: false, message: 'PayPal payout failed', error: payoutError.response?.data?.message || payoutError.message });
-      }
-    } else if (withdrawalMethod.method_type === 'bank_transfer') {
-      if (!isPaystackConfigured()) {
-        await connection.rollback();
-        return res.status(503).json({
-          success: false,
-          message: 'Bank transfer payouts are not set up yet. Add PAYSTACK_SECRET_KEY and PAYSTACK_PUBLIC_KEY to the server .env to activate this method.'
-        });
-      }
-      if (!accountDetails.account_number || !accountDetails.bank_code) {
-        await connection.rollback();
-        return res.status(400).json({ success: false, message: 'This bank withdrawal method is missing an account number or bank code' });
-      }
-
-      try {
-        // Step 1: create (or reuse) a transfer recipient
-        let recipientCode = accountDetails.recipient_code;
-        if (!recipientCode) {
-          const recipientResponse = await axios.post(
-            `${PAYSTACK_BASE_URL}/transferrecipient`,
-            {
-              type: 'nuban',
-              name: accountDetails.account_name || withdrawalMethod.method_name,
-              account_number: accountDetails.account_number,
-              bank_code: accountDetails.bank_code,
-              currency
-            },
-            { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
-          );
-          recipientCode = recipientResponse.data.data.recipient_code;
-          // Cache it so future withdrawals from this method skip recipient creation
-          await connection.execute(
-            'UPDATE withdrawal_methods SET account_details = ? WHERE id = ?',
-            [JSON.stringify({ ...accountDetails, recipient_code: recipientCode }), withdrawalMethod.id]
-          );
-        }
-
-        // Step 2: initiate the transfer
-        const transferResponse = await axios.post(
-          `${PAYSTACK_BASE_URL}/transfer`,
-          {
-            source: 'balance',
-            amount: Math.round(netAmount * 100), // kobo
-            recipient: recipientCode,
-            reason: `Withdrawal for user ${userId}`
-          },
-          { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
-        );
-        withdrawalSuccessful = true;
-        gatewayTransactionId = transferResponse.data.data.transfer_code || transferResponse.data.data.reference;
-      } catch (transferError) {
-        console.error('Paystack transfer failed:', transferError.response?.data || transferError.message);
-        await connection.rollback();
-        return res.status(502).json({ success: false, message: 'Bank transfer payout failed', error: transferError.response?.data?.message || transferError.message });
-      }
-    } else {
-      await connection.rollback();
-      return res.status(400).json({ success: false, message: `Unsupported withdrawal method type: ${withdrawalMethod.method_type}` });
-    }
-
-    if (withdrawalSuccessful) {
-      // Deduct from withdrawable wallet (row is still locked from above)
-      await connection.execute(
-        'UPDATE wallets SET balance = balance - ? WHERE id = ?',
-        [amount, withdrawableWallet.id]
-      );
-
-      console.log(`Withdrawal: -${amount} ${currency} from wallet ${withdrawableWallet.id} for user ${userId}`);
-
-      // Record withdrawal transaction
-      await connection.execute(
-        `INSERT INTO wallet_transactions (
-          from_wallet_id, transaction_type, amount, currency, description,
-          payment_gateway, gateway_transaction_id, gateway_fee, status, processed_at
-        ) VALUES (?, 'withdrawal', ?, ?, ?, ?, ?, ?, 'completed', NOW())`,
-        [
-          withdrawableWallet.id, netAmount, currency,
-          `Withdrawal via ${withdrawalMethod.method_type}`,
-          withdrawalMethod.method_type, gatewayTransactionId, withdrawalFee
-        ]
-      );
-
-      await connection.commit();
-
-      res.json({
-        success: true,
-        message: 'Withdrawal successful',
-        netAmount,
-        withdrawalFee,
-        gatewayTransactionId
-      });
-    } else {
-      // Should be unreachable (every branch above either sets
-      // withdrawalSuccessful=true or returns early), but guard anyway.
-      await connection.rollback();
-      res.status(500).json({ success: false, message: 'Withdrawal processing failed' });
-    }
-  } catch (error) {
-    console.error('Withdrawal failed:', error);
-    if (connection) {
-      try { await connection.rollback(); } catch (rollbackErr) { /* connection may already be broken */ }
-    }
-    res.status(500).json({ success: false, message: 'Withdrawal failed', error: error.message });
-  } finally {
-    if (connection) connection.release();
-  }
+router.post('/withdraw', async (req,res)=>{
+  const {amount,currency='USD',withdrawalMethodId}=req.body||{}; const value=Number(amount); const userId=req.user.id;
+  if(!Number.isFinite(value)||value<=0)return res.status(400).json({success:false,message:'amount must be greater than 0'});
+  try{
+    const [[method]]=await db.execute('SELECT * FROM withdrawal_methods WHERE id=? AND user_id=? AND is_active=1',[withdrawalMethodId,userId]); if(!method)return res.status(404).json({success:false,message:'Withdrawal method not found'});
+    const currencyUpper=String(currency).toUpperCase();
+    const [[wallet]]=await db.execute(`SELECT * FROM wallets WHERE user_id=? AND wallet_type='withdrawable' AND currency=? AND status='active'`,[userId,currencyUpper]); if(!wallet||Number(wallet.balance)<value)return res.status(400).json({success:false,message:'Insufficient withdrawable balance'});
+    const details=method.account_details?JSON.parse(method.account_details):{}; const fee=value*0.02; const net=value-fee; let gatewayTransactionId=null;
+    if(method.method_type==='paypal'){
+      if(!isPaypalPayoutsConfigured()||!details.email)return res.status(503).json({success:false,message:'PayPal payouts are not configured'});
+      const accessToken=await getAccessToken(); const payout=await axios.post(`${BASE_URL}/v1/payments/payouts`,{sender_batch_header:{sender_batch_id:`payout_${userId}_${Date.now()}`},items:[{recipient_type:'EMAIL',amount:{value:net.toFixed(2),currency:currencyUpper},receiver:details.email}]},{headers:{Authorization:`Bearer ${accessToken}`}}); gatewayTransactionId=payout.data.batch_header?.payout_batch_id||`paypal_${Date.now()}`;
+    } else if(method.method_type==='bank_transfer'){
+      if(!isPaystackConfigured()||!details.account_number||!details.bank_code)return res.status(503).json({success:false,message:'Bank payout is not configured'});
+      let recipientCode=details.recipient_code; if(!recipientCode){const rr=await axios.post(`${PAYSTACK_BASE_URL}/transferrecipient`,{type:'nuban',name:details.account_name||method.method_name,account_number:details.account_number,bank_code:details.bank_code,currency:currencyUpper},{headers:{Authorization:`Bearer ${PAYSTACK_SECRET_KEY}`}});recipientCode=rr.data.data.recipient_code;await db.execute('UPDATE withdrawal_methods SET account_details=? WHERE id=?',[JSON.stringify({...details,recipient_code:recipientCode}),method.id]);}
+      const tr=await axios.post(`${PAYSTACK_BASE_URL}/transfer`,{source:'balance',amount:Math.round(net*100),recipient:recipientCode,reason:`Withdrawal for user ${userId}`},{headers:{Authorization:`Bearer ${PAYSTACK_SECRET_KEY}`}}); gatewayTransactionId=tr.data.data.transfer_code||tr.data.data.reference;
+    } else return res.status(400).json({success:false,message:'Unsupported withdrawal method type'});
+    const result=await debitUser({userId,walletType:'withdrawable',currency:currencyUpper,amount:value,transactionType:'withdrawal',description:`Withdrawal via ${method.method_type}`,actorId:userId,reason:'withdrawal',connection:null,paymentGateway:method.method_type,gatewayTransactionId});
+    return res.json({success:true,message:'Withdrawal successful',netAmount:net,withdrawalFee:fee,gatewayTransactionId,result});
+  }catch(e){console.error('Withdrawal failed:',e.message);return res.status(e.status||502).json({success:false,message:e.status?e.message:'Withdrawal failed'});}
 });
 
 // =======================
@@ -761,24 +331,11 @@ router.post('/convert-earnings', async (req, res) => {
       spendableWallet = await getUserWallet(userId, 'spendable', currency);
     }
     
-    // Add earnings to spendable wallet
-    await db.execute(
-      'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-      [amount, spendableWallet.id]
-    );
-    
-    // Record earning transaction
-    await db.execute(
-      `INSERT INTO wallet_transactions (
-        to_wallet_id, transaction_type, amount, currency, errand_id,
-        description, status, processed_at
-      ) VALUES (?, 'earning', ?, ?, ?, ?, 'completed', NOW())`,
-      [spendableWallet.id, amount, currency, errandId, `Earnings from errand #${errandId}`]
-    );
+    await creditUser({userId,amount:Number(amount),currency,walletType:'spendable',transactionType:'earning',description:`Earnings from errand #${errandId}`,actorId:userId,reason:`earning_conversion:${errandId}`});
     
     res.json({ success: true, message: 'Earnings converted to spendable balance', amount });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Earnings conversion failed', error: error.message });
+    res.status(500).json({ success: false, message: 'Earnings conversion failed', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -825,11 +382,7 @@ router.post('/giftcards/create', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Insufficient spendable balance for this gift card amount' });
     }
 
-    // Deduct from spendable balance
-    await connection.execute(
-      'UPDATE wallets SET balance = balance - ? WHERE id = ?',
-      [numericAmount, spendableWallet.id]
-    );
+    const giftDebit = await debitUser({userId,walletType:'spendable',currency:upperCurrency,amount:numericAmount,transactionType:'gift_card_issue',description:'Gift card created from spendable balance',actorId:userId,reason:'gift_card_issue',connection});
 
     // Generate a unique code (retry on the rare collision)
     let code;
@@ -852,11 +405,7 @@ router.post('/giftcards/create', async (req, res) => {
       [code, userId, numericAmount, upperCurrency]
     );
 
-    await connection.execute(
-      `INSERT INTO wallet_transactions (from_wallet_id, transaction_type, amount, currency, description, status, processed_at)
-       VALUES (?, 'gift_card_issue', ?, ?, ?, 'completed', NOW())`,
-      [spendableWallet.id, numericAmount, upperCurrency, `Gift card ${code} created from spendable balance`]
-    );
+
 
     await connection.commit();
 
@@ -868,7 +417,7 @@ router.post('/giftcards/create', async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Gift card creation failed:', error);
-    res.status(500).json({ success: false, message: 'Failed to create gift card', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to create gift card', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   } finally {
     connection.release();
   }
@@ -923,11 +472,7 @@ router.post('/giftcards/redeem', async (req, res) => {
       spendableWallet = { id: created.insertId, balance: 0 };
     }
 
-    // Credit the wallet
-    await connection.execute(
-      'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-      [card.amount, spendableWallet.id]
-    );
+    const giftCredit = await creditUser({userId,walletType:'spendable',currency:card.currency,amount:Number(card.amount),transactionType:'gift_card_redeem',description:`Gift card ${card.code} redeemed`,actorId:userId,reason:`gift_card_redeem:${card.id}`,connection});
 
     // Mark the card redeemed — this, combined with the row lock above, is
     // what guarantees a card can never be redeemed twice
@@ -936,11 +481,7 @@ router.post('/giftcards/redeem', async (req, res) => {
       [userId, card.id]
     );
 
-    await connection.execute(
-      `INSERT INTO wallet_transactions (to_wallet_id, transaction_type, amount, currency, description, status, processed_at)
-       VALUES (?, 'gift_card_redeem', ?, ?, ?, 'completed', NOW())`,
-      [spendableWallet.id, card.amount, card.currency, `Gift card ${card.code} redeemed`]
-    );
+
 
     await connection.commit();
 
@@ -953,7 +494,7 @@ router.post('/giftcards/redeem', async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Gift card redemption failed:', error);
-    res.status(500).json({ success: false, message: 'Failed to redeem gift card', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to redeem gift card', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   } finally {
     connection.release();
   }
@@ -973,7 +514,7 @@ router.get('/giftcards/mine', async (req, res) => {
     );
     res.json({ success: true, created, redeemed });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to fetch gift cards', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch gift cards', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -1014,7 +555,7 @@ router.get('/transactions', async (req, res) => {
     res.json({ success: true, transactions, page: parseInt(page), limit: parseInt(limit) });
   } catch (error) {
     console.error('Error fetching transactions:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch transactions', error: error.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch transactions', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -1057,7 +598,7 @@ router.get('/debug/status', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Debug failed', error: error.message });
+    res.status(500).json({ success: false, message: 'Debug failed', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   }
 });
 
@@ -1097,28 +638,7 @@ router.post('/transfer-to-spendable', async (req, res) => {
       spendableWallet = { id: created.insertId, balance: 0 };
     }
 
-    // Transfer from withdrawable to spendable
-    await connection.execute(
-      'UPDATE wallets SET balance = balance - ? WHERE id = ?',
-      [amount, withdrawableWallet.id]
-    );
-
-    await connection.execute(
-      'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-      [amount, spendableWallet.id]
-    );
-
-    // Record transfer transaction
-    await connection.execute(
-      `INSERT INTO wallet_transactions (
-        from_wallet_id, to_wallet_id, transaction_type, amount, currency,
-        description, status, processed_at
-      ) VALUES (?, ?, 'internal_transfer', ?, ?, ?, 'completed', NOW())`,
-      [
-        withdrawableWallet.id, spendableWallet.id, amount, currency,
-        `Transfer from withdrawable to spendable wallet`
-      ]
-    );
+    await transferWallets({fromWalletId:withdrawableWallet.id,toWalletId:spendableWallet.id,fromAmount:Number(amount),toAmount:Number(amount),currency,transactionType:'internal_transfer',description:'Transfer from withdrawable to spendable wallet',actorId:userId,reason:'internal_transfer',connection});
 
     await connection.commit();
 
@@ -1130,7 +650,7 @@ router.post('/transfer-to-spendable', async (req, res) => {
   } catch (error) {
     await connection.rollback();
     console.error('Transfer to spendable failed:', error);
-    res.status(500).json({ success: false, message: 'Transfer failed', error: error.message });
+    res.status(500).json({ success: false, message: 'Transfer failed', error: process.env.NODE_ENV === 'production' ? 'Request failed' : error.message });
   } finally {
     connection.release();
   }

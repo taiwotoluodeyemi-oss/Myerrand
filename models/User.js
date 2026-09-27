@@ -8,6 +8,14 @@ const userSchema = new mongoose.Schema({
   phone: { type: String, default: null },
   address: { type: String, default: null },
   balance: { type: Number, default: 0 },
+  authVersion: { type: Number, default: 0 },
+  passwordChangedAt: { type: Date, default: null },
+  failedLoginAttempts: { type: Number, default: 0 },
+  lockedUntil: { type: Date, default: null },
+  isActive: { type: Boolean, default: true },
+  status: { type: String, default: 'active' },
+  deactivatedAt: { type: Date, default: null },
+  anonymizedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 }, {

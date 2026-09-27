@@ -166,13 +166,13 @@ function ErrandList({ errands, onAddErrand, onUpdateStatus }) {
                 <div className="errand-actions">
                   {errand.status === 'pending' && (
                     <button 
-                      onClick={() => onUpdateStatus(errand.id, 'in-progress')}
+                      onClick={() => onUpdateStatus(errand.id, 'picked_up')}
                       className="button small"
                     >
                       Start Task
                     </button>
                   )}
-                  {errand.status === 'in-progress' && (
+                  {['picked_up', 'in_progress'].includes(errand.status) && (
                     <button 
                       onClick={() => onUpdateStatus(errand.id, 'completed')}
                       className="button small success"

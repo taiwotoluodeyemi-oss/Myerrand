@@ -1,7 +1,6 @@
 const express = require('express');
 const path = require('path');
 const cors = require('cors');
-const morgan = require('morgan');
 const helmet = require('helmet'); // Add helmet for security headers
 const cookieParser = require('cookie-parser'); // Add cookie-parser for JWT cookies
 require('dotenv').config();
@@ -24,6 +23,9 @@ const apiLimiter = rateLimit({
 // Rate limiter is already defined above
 // Database connection
 const app = express();
+const logger = require('./config/winston');
+const observability = require('./services/observability');
+const observabilityMiddleware = require('./middleware/observability');
 
 // Security middleware
 app.use(helmet());
@@ -87,22 +89,37 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token', 'X-API-Key', 'Idempotency-Key']
 }));
+
+// Merchant API requests have a stricter payload ceiling than the general API.
+// This runs before JSON parsing so oversized bodies are rejected without being
+// parsed or allocated by the application.
+app.use('/api/merchant', (req, res, next) => {
+  const max = Number(process.env.MERCHANT_MAX_PAYLOAD_BYTES || 64 * 1024);
+  const length = Number(req.headers['content-length'] || 0);
+  if (Number.isFinite(length) && length > max) {
+    return res.status(413).json({ success: false, error: 'Request payload too large' });
+  }
+  next();
+});
+
+// Correlation and structured request logging. Sensitive request bodies are never logged.
+app.use(observabilityMiddleware);
 
 // Body parsing middleware
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 app.use(cookieParser());
 
-// Logging middleware
-app.use(morgan('dev'));
 
 // Apply rate limiting to all API routes
 app.use('/api', apiLimiter);
 
-// Simple health checks
-app.get('/health', (req, res) => res.json({ ok: true, service: 'my-errand-app', time: new Date().toISOString() }));
+// Process and dependency health checks. /health is intentionally cheap; /health/db verifies MySQL.
+app.get('/health', (req, res) => res.json({ ok: true, service: 'my-errand-app', time: new Date().toISOString(), uptime_seconds: Math.floor(process.uptime()) }));
+app.get('/health/db', async (req, res) => { const health = await observability.databaseHealth(); res.status(health.ok ? 200 : 503).json({ ok: health.ok, service: 'mysql', latency_ms: health.latency_ms, ...(health.ok ? {} : { error: 'DATABASE_UNAVAILABLE' }) }); });
+app.get('/health/dependencies', async (req, res) => { const health = await observability.dependencyHealth(); res.status(health.ok ? 200 : 503).json(health); });
 app.get('/api/health', (req, res) => res.json({ ok: true, service: 'api', time: new Date().toISOString() }));
 
 // Import authentication middleware
@@ -111,7 +128,10 @@ const walletRoutes = require('./routes/wallet.routes');
 
 // Import Routes
 app.use('/api/auth', require('./routes/auth.routes'));
+app.use('/api/markets', require('./routes/market.routes'));
 app.use('/api/errands', require('./routes/errands.routes'));
+app.use('/api/merchant', require('./routes/merchant.routes'));
+app.use('/api/orgs', require('./routes/org.routes'));
 // Wallet: JWT required except Paystack webhook (verified by provider signature inside route)
 app.use('/api/wallet', (req, res, next) => {
   if (req.method === 'POST' && (req.path === '/paystack/webhook' || req.path === '/webhook/paystack')) {
@@ -122,8 +142,11 @@ app.use('/api/wallet', (req, res, next) => {
 app.use('/api/admin', require('./routes/admin.routes'));
 app.use('/api/ratings', require('./routes/ratings.routes'));
 app.use('/api/notifications', require('./routes/notifications.routes'));
+app.use('/api/growth', require('./routes/growth.routes'));
 app.use('/api/messages', require('./routes/messages.routes'));
 app.use('/api/verification', require('./routes/verification.routes'));
+app.use('/api/policies', require('./routes/policy.routes'));
+app.use('/api/privacy', require('./routes/privacy.routes'))
 app.use('/api/gift-cards', require('./routes/giftcards.routes'));
 // Mount client and agent routes for frontend AuthService endpoints
 app.use('/api/clients', require('./routes/client.routes'));

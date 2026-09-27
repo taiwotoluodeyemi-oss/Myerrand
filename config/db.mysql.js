@@ -31,7 +31,10 @@ function buildSslConfig() {
   if (isLocal) {
     return false; // no SSL for local
   }
-  console.warn('[MySQL] No CA file found – connecting with SSL but without certificate verification');
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('MYSQL_CA_PATH/ca.pem is required for verified TLS to a remote MySQL server in production');
+  }
+  console.warn('[MySQL] No CA file found – connecting with SSL without certificate verification (development only)');
   return { rejectUnauthorized: false };
 }
 

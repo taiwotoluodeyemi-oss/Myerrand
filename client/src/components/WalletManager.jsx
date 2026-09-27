@@ -209,7 +209,7 @@ const WalletManager = () => {
     try {
       if (paymentMethod === 'paystack') {
         // Step 1: Initialize Paystack transaction
-        const intentResponse = await axios.post('/api/wallet/deposit/create-intent', {
+        const intentResponse = await axios.post('/api/wallet/deposit/intent', {
           amount: parseFloat(depositAmount),
           currency: selectedCurrency,
           paymentMethod: 'paystack',
@@ -239,7 +239,7 @@ const WalletManager = () => {
   // Handle Paystack callback verification
   const verifyPaystackPayment = async (reference) => {
     try {
-      const response = await axios.post('/api/wallet/paystack/verify', {
+      const response = await axios.post('/api/wallet/deposit/verify', {
         reference
       }, authHeaders());
 

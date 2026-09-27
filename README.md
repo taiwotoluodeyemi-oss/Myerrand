@@ -141,3 +141,7 @@ See [APK_BUILD.md](./APK_BUILD.md) for JDK/Android SDK steps and release signing
 
 
 Automatic international setup runs inside `npm run bootstrap`. Refresh FX: `npm run international`.
+
+## Cloudflare Pages / GO54 deployment
+
+The production deployment architecture is documented in `docs/CLOUDFLARE_GO54_GITHUB_DEPLOYMENT.md`. The frontend is built from `client/` by Cloudflare Pages from GitHub, while the Node.js API runs separately on GO54 at `api.myerrand.name.ng`.

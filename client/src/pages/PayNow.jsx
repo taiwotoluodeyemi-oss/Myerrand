@@ -93,7 +93,7 @@ function PayNow({ user, setUser }) {
 
   const verifyPaystackPayment = async (reference) => {
     try {
-      const response = await axios.post('/api/wallet/paystack/verify', { reference })
+      const response = await axios.post('/api/wallet/deposit/verify', { reference })
       if (response.data.success) {
         setMessage('Payment verified and deposit successful!')
         fetchWallets() // Refresh wallet balances
@@ -128,7 +128,7 @@ function PayNow({ user, setUser }) {
       if (operationType === 'deposit') {
         if (paymentMethod === 'paystack') {
           // Initialize Paystack transaction
-          const response = await axios.post('/api/wallet/deposit/create-intent', {
+          const response = await axios.post('/api/wallet/deposit/intent', {
             amount: numAmount,
             currency: 'NGN', // Paystack works with NGN
             paymentMethod: 'paystack',
@@ -209,7 +209,7 @@ function PayNow({ user, setUser }) {
   return (
     <div className="payment-page">
       <div className="balance-display">
-        <h3>Wallet Balances</h3>
+        <h3>Accounts</h3>
         <div className="balance-section">
           <div className="balance-item">
             <span className="balance-label">💰 Spendable Balance:</span>

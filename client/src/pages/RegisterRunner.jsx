@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { apiUrl } from '../api'
 import './Auth.css'
@@ -12,6 +12,7 @@ function RegisterRunner() {
     phone: '',
     vehicleType: 'none',
     areasOfService: '',
+    serviceZones: '',
     availableHours: '',
     preferredErrandTypes: [],
     insuranceCoverage: false,
@@ -23,9 +24,18 @@ function RegisterRunner() {
   })
 
   const [isLoading, setIsLoading] = useState(false)
+  const [zones, setZones] = useState(['Central'])
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const navigate = useNavigate()
+
+  useEffect(() => {
+    fetch(apiUrl('/api/errands/config/zones'), { headers: { Authorization: `Bearer ${localStorage.getItem('token')}` } })
+      .then(r => r.json()).then(data => {
+        const list = data?.data?.zones || data?.zones || data?.data?.zones || [];
+        if (Array.isArray(list) && list.length) setZones(list.map(z => typeof z === 'string' ? z : z.zone).filter(Boolean));
+      }).catch(() => {});
+  }, []);
 
   const errandTypes = [
     'Grocery Shopping',
@@ -69,6 +79,10 @@ function RegisterRunner() {
       setError('Password must be at least 6 characters long')
       return false
     }
+    if (!String(formData.serviceZones || formData.areasOfService || '').trim()) {
+      setError('Select at least one service zone')
+      return false
+    }
     if (!formData.termsAccepted) {
       setError('You must accept the Terms of Service')
       return false
@@ -95,6 +109,7 @@ function RegisterRunner() {
       const registrationData = {
         ...formData,
         userType: 'runner',
+        serviceZones: formData.serviceZones || formData.areasOfService,
         preferredErrandTypes: formData.preferredErrandTypes.join(',')
       }
 
@@ -244,15 +259,15 @@ function RegisterRunner() {
               </div>
 
               <div className="form-group">
-                <label htmlFor="areasOfService">Areas of Service</label>
-                <input
-                  type="text"
-                  id="areasOfService"
-                  name="areasOfService"
-                  value={formData.areasOfService}
-                  onChange={handleChange}
-                  placeholder="Neighborhoods or areas you cover"
-                />
+                <label htmlFor="serviceZones">Primary Service Zone *</label>
+                <select id="serviceZones" name="serviceZones" value={formData.serviceZones} onChange={handleChange} required>
+                  <option value="">Select a zone</option>
+                  {zones.map(zone => <option key={zone} value={zone}>{zone}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label htmlFor="areasOfService">Other Areas (optional)</label>
+                <input type="text" id="areasOfService" name="areasOfService" value={formData.areasOfService} onChange={handleChange} placeholder="Optional nearby areas" />
               </div>
             </div>
 

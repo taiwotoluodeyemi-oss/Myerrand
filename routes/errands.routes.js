@@ -28,49 +28,32 @@ const upload = multer({
   },
   fileFilter: (req, file, cb) => {
     // Accept images, videos, and documents
-    if (file.fieldname === 'images') {
-      if (file.mimetype.startsWith('image/')) {
-        cb(null, true);
-      } else {
-        cb(new Error('Only image files are allowed for images field'));
-      }
-    } else if (file.fieldname === 'videos') {
-      if (file.mimetype.startsWith('video/')) {
-        cb(null, true);
-      } else {
-        cb(new Error('Only video files are allowed for videos field'));
-      }
-    } else if (file.fieldname === 'documents') {
-      if (file.mimetype === 'application/pdf' || 
-          file.mimetype === 'application/msword' ||
-          file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-          file.mimetype === 'text/plain') {
-        cb(null, true);
-      } else {
-        cb(new Error('Only PDF, DOC, DOCX, and TXT files are allowed for documents field'));
-      }
-    } else {
-      cb(new Error('Unexpected field'));
-    }
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const imageExt = new Set(['.jpg','.jpeg','.png','.webp']);
+    const videoExt = new Set(['.mp4','.mov','.webm','.m4v']);
+    const docExt = new Set(['.pdf','.doc','.docx','.txt']);
+    if (file.fieldname === 'images' && file.mimetype.startsWith('image/') && imageExt.has(ext)) return cb(null, true);
+    if (file.fieldname === 'videos' && file.mimetype.startsWith('video/') && videoExt.has(ext)) return cb(null, true);
+    if (file.fieldname === 'documents' && ['application/pdf','application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document','text/plain'].includes(file.mimetype) && docExt.has(ext)) return cb(null, true);
+    cb(new Error('File type is not allowed for this upload field'));
   }
 });
 
 // Utility functions for handling wallets
-const { 
-  getUserWallet, 
-  updateWalletBalance, 
-  createWalletTransaction, 
-  processErrandPayment, 
-  releaseEscrowFunds,
-  getAllWalletBalances 
-} = require('../utils/wallet-utils');
+const { getAllWalletBalances } = require('../utils/wallet-utils');
+const { createHold, releaseHold, refundHold, processDueReleases, processDueRefunds } = require('../services/errandMoney');
+const { transitionErrand, canonicalStatus } = require('../services/errandState');
+const { DISPUTE_WINDOW_HOURS, PRIMARY_MARKET, MARKETS } = require('../config/marketplace');
+const { CLIENT_POLICIES, RUNNER_POLICIES, assertPoliciesAccepted, assertLiabilityAccepted } = require('../services/policyGate');
 
 const { v4: uuidv4 } = require('uuid');
 const { verifyToken } = require('./auth.routes');
 const { requireClient, requireRunner, requireAdmin } = require('../middleware/auth');
 const { geocodeAddress, isGeocodingConfigured } = require('../utils/geocode');
 const { notifyUser } = require('../utils/notify');
+const { enqueueEventAfterCommit } = require('../services/eventOutbox');
 const { calculateErrandPrice } = require('../utils/pricing');
+const { auditSecurity } = require('../services/securityAudit');
 
 const jsonResponse = (res, status, success, data = null, error = null) => {
     res.status(status).json({
@@ -96,14 +79,20 @@ router.get('/', verifyToken, async (req, res) => {
     `;
     let params = [];
     
-    if (user_type === 'client') {
+    const role = req.user.userType || req.user.user_type || req.user.role;
+    if (role === 'admin') {
+      if (user_type === 'client') { query += ' WHERE e.client_id = ?'; params.push(userId); }
+      else if (user_type === 'runner') { query += ' WHERE e.runner_id = ?'; params.push(userId); }
+    } else if (role === 'client' || user_type === 'client') {
       query += ' WHERE e.client_id = ?';
       params.push(userId);
-    } else if (user_type === 'runner') {
-      query += ' WHERE e.runner_id = ? OR e.runner_id IS NULL';
+    } else if (role === 'runner' || user_type === 'runner') {
+      query += ' WHERE e.runner_id = ?';
       params.push(userId);
+    } else {
+      return jsonResponse(res, 403, false, null, 'Role is not permitted to list errands');
     }
-    
+
     if (status) {
       query += params.length > 0 ? ' AND e.status = ?' : ' WHERE e.status = ?';
       params.push(status);
@@ -171,12 +160,31 @@ router.post('/create', verifyToken, requireClient, async (req, res) => {
       title, description, pickup_address, delivery_address,
       estimated_hours, weight_kg, urgency, category, mode,
       pickup_lat, pickup_lng, delivery_lat, delivery_lng,
+      country, city, zone, market_id, channel = 'consumer', business_reference, reference, contact_phone, phone,
     } = req.body;
     const clientId = req.user.id;
 
     if (!title || !pickup_address || !delivery_address) {
       return jsonResponse(res, 400, false, null, 'title, pickup_address and delivery_address are required');
     }
+
+    const normalizedChannel = channel === 'business' ? 'business' : 'consumer';
+    const normalizedReference = business_reference || reference || null;
+    const normalizedPhone = contact_phone || phone || null;
+    if (normalizedChannel === 'business' && (!normalizedReference || !normalizedPhone)) {
+      return jsonResponse(res, 400, false, null, 'Business errands require reference and contact phone');
+    }
+    const selectedMarket = MARKETS.find(m => m.id === market_id) || PRIMARY_MARKET;
+    if (selectedMarket.status === 'paused') return jsonResponse(res, 409, false, null, 'This market is temporarily paused for new demand');
+    const normalizedCountry = country || selectedMarket.country || PRIMARY_MARKET.country;
+    const normalizedCity = city || selectedMarket.city || PRIMARY_MARKET.city;
+    const normalizedZone = zone || selectedMarket.zones[0];
+    if (!normalizedZone) return jsonResponse(res, 400, false, null, 'A service zone is required');
+    if (!selectedMarket.zones.includes(normalizedZone)) return jsonResponse(res, 400, false, null, 'Selected service zone is not configured');
+    try {
+      const [zoneRows] = await pool.execute('SELECT pause_demand FROM market_zones WHERE country=? AND city=? AND zone=?', [country || PRIMARY_MARKET.country, city || PRIMARY_MARKET.city, normalizedZone]);
+      if (zoneRows[0]?.pause_demand) return jsonResponse(res, 409, false, null, 'This zone is temporarily paused for new demand');
+    } catch (zoneErr) { if (zoneErr.code !== 'ER_NO_SUCH_TABLE') throw zoneErr; }
 
     let plat = pickup_lat != null ? parseFloat(pickup_lat) : null;
     let plng = pickup_lng != null ? parseFloat(pickup_lng) : null;
@@ -192,10 +200,7 @@ router.post('/create', verifyToken, requireClient, async (req, res) => {
       if (coords) { dlat = coords.lat; dlng = coords.lng; }
     }
 
-    if (![plat, plng, dlat, dlng].every(Number.isFinite)) {
-      return jsonResponse(res, 400, false, null,
-        'Could not resolve coordinates. Provide pickup_lat/lng and delivery_lat/lng, or enable geocoding.');
-    }
+    // Address text is sufficient; coordinates remain optional when geocoding is unavailable.
 
     const transportMode = (mode || 'motorcycle').toLowerCase();
     const urgencyLevel = urgency || 'medium';
@@ -212,7 +217,8 @@ router.post('/create', verifyToken, requireClient, async (req, res) => {
     // amount / budget_amount = client_total (what escrow holds & client pays)
     const [result] = await pool.execute(
       `INSERT INTO errands (
-         client_id, title, description, pickup_address, delivery_address,
+         client_id, title, description, pickup_address, delivery_address, country, city, zone, market_id,
+         channel, business_reference, contact_phone,
          pickup_latitude, pickup_longitude, delivery_latitude, delivery_longitude,
          amount, budget_amount, estimated_hours, weight_kg, urgency, category, mode,
          distance_km, base_fare, distance_cost, fuel_cost, urgency_fee, subtotal,
@@ -227,7 +233,8 @@ router.post('/create', verifyToken, requireClient, async (req, res) => {
          'pending', NULL
        )`,
       [
-        clientId, title, description || null, pickup_address, delivery_address,
+        clientId, title, description || null, pickup_address, delivery_address, normalizedCountry, normalizedCity, normalizedZone, selectedMarket.id,
+        normalizedChannel, normalizedReference, normalizedPhone,
         plat, plng, dlat, dlng,
         quote.client_total, quote.client_total,
         estimated_hours || 1, weight_kg || 0, urgencyLevel, category || null, transportMode,
@@ -247,21 +254,32 @@ router.post('/create', verifyToken, requireClient, async (req, res) => {
     // If new columns are missing, surface a clearer migration hint
     if (error.code === 'ER_BAD_FIELD_ERROR') {
       return jsonResponse(res, 500, false, null,
-        `${error.message}. Apply database/07-pricing-engine.sql migration.`);
+        `${error.message}. Apply the latest database migrations (pricing, money, zone and market).`);
     }
     jsonResponse(res, status, false, null, error.message);
   }
 });
 
+// Primary-market zone configuration for create forms and runner discovery.
+router.get('/config/zones', async (req, res) => {
+  jsonResponse(res, 200, true, PRIMARY_MARKET);
+});
+
 // Get unassigned errands for runners
 router.get('/unassigned', verifyToken, requireRunner, async (req, res) => {
   try {
+    const [runnerRows] = await pool.execute('SELECT service_zones, areas_of_service FROM runners WHERE user_id = ?', [req.user.id]);
+    const runnerZones = String(runnerRows[0]?.service_zones || runnerRows[0]?.areas_of_service || '').split(',').map((z) => z.trim()).filter(Boolean);
     const [errands] = await pool.execute(
       `SELECT e.*, u.name as client_name 
        FROM errands e 
        LEFT JOIN users u ON e.client_id = u.id 
-       WHERE e.runner_id IS NULL AND e.status = 'pending' 
-       ORDER BY e.created_at DESC`
+       WHERE e.runner_id IS NULL AND e.status = 'paid' AND e.payment_status = 'escrowed'
+         AND (? = '' OR e.zone IS NULL OR FIND_IN_SET(REPLACE(e.zone, ' ', ''), REPLACE(?, ' ', '')) > 0)
+       ORDER BY CASE WHEN ? <> '' AND FIND_IN_SET(REPLACE(e.zone, ' ', ''), REPLACE(?, ' ', '')) > 0 THEN 0 ELSE 1 END,
+                CASE WHEN e.pickup_latitude IS NOT NULL AND e.pickup_longitude IS NOT NULL THEN 0 ELSE 1 END,
+                e.created_at DESC`,
+      [runnerZones.join(','), runnerZones.join(','), runnerZones.join(','), runnerZones.join(',')]
     );
     
     jsonResponse(res, 200, true, errands);
@@ -281,7 +299,7 @@ router.patch('/assign/:errand_id', verifyToken, requireRunner, async (req, res) 
     
     // Check if errand exists and is available
     const [errand] = await connection.execute(
-      `SELECT * FROM errands WHERE id = ? AND runner_id IS NULL AND status ='pending'`,
+      `SELECT * FROM errands WHERE id = ? AND runner_id IS NULL AND status ='paid' AND payment_status='escrowed'`,
       [errandId]
     );
     
@@ -305,103 +323,46 @@ router.patch('/assign/:errand_id', verifyToken, requireRunner, async (req, res) 
   }
 });
 
-// Pay for errand (move funds to escrow)
+// Pay for errand: the money engine creates exactly one errand hold.
 router.post('/pay/:errand_id', verifyToken, requireClient, async (req, res) => {
   try {
-    const errandId = req.params.errand_id;
-    const clientId = req.user.id;
-    
-    // Get errand details. payment_status is NULL until paid (see /create),
-    // so "unpaid" means NULL — but also accept the legacy 'pending' string
-    // for rows created before this fix.
-    const [errand] = await pool.execute(
-      `SELECT * FROM errands WHERE id = ? AND client_id = ? AND (payment_status IS NULL OR payment_status ='pending')`,
-      [errandId, clientId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or already paid');
-    }
-    
-    // Process payment to escrow
-    const result = await processErrandPayment(clientId, errandId, errand[0].amount);
+    const [[errand]] = await pool.execute('SELECT id,market_id FROM errands WHERE id=? AND client_id=?',[req.params.errand_id,req.user.id]);
+    if (!errand) return jsonResponse(res,404,false,null,'Errand not found or you are not authorized to pay');
+    await assertPoliciesAccepted(req.user.id, CLIENT_POLICIES);
+    const result = await createHold(req.params.errand_id, req.user.id, 'USD', Boolean(req.body?.is_demo));
     jsonResponse(res, 200, true, result);
   } catch (error) {
-    jsonResponse(res, 500, false, null, error.message);
+    jsonResponse(res, error.status || 500, false, null, error.message || 'Payment failed');
   }
 });
 
-// Start errand
+// Pickup/start errand. Legacy clients may still call this route; the DB now records picked_up.
 router.patch('/start/:errand_id', verifyToken, requireRunner, async (req, res) => {
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-    
-    const errandId = req.params.errand_id;
-    const runnerId = req.user.id;
-    
-    // Check if errand is assigned to this runner
-    const [errand] = await connection.execute(
-      `SELECT * FROM errands WHERE id = ? AND runner_id = ? AND status ='assigned'`,
-      [errandId, runnerId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or not assigned to you');
-    }
-    
-    await connection.execute(
-      `UPDATE errands SET status ='in_progress', started_at = NOW() WHERE id = ?`,
-      [errandId]
-    );
-    
-    await connection.commit();
-    jsonResponse(res, 200, true, { message: 'Errand started successfully' });
+    const errand = await transitionErrand(req.params.errand_id, 'picked_up', req.user);
+    jsonResponse(res, 200, true, { message: 'Errand picked up successfully', status: errand.status });
   } catch (error) {
-    await connection.rollback();
-    jsonResponse(res, 500, false, null, error.message);
-  } finally {
-    connection.release();
+    jsonResponse(res, error.status || 500, false, null, error.message);
   }
 });
 
-// Complete errand
+// Deliver errand. Funds remain held until the 24-hour release window passes.
+router.patch('/deliver/:errand_id', verifyToken, requireRunner, async (req, res) => {
+  try {
+    const errand = await transitionErrand(req.params.errand_id, 'delivered', req.user);
+    jsonResponse(res, 200, true, { message: 'Errand delivered; funds remain held for the release window', status: errand.status });
+  } catch (error) {
+    jsonResponse(res, error.status || 500, false, null, error.message);
+  }
+});
+
+// Complete errand. Completion never directly pays the runner; releaseHold owns money movement.
 router.patch('/complete/:errand_id', verifyToken, requireRunner, async (req, res) => {
   try {
-    const errandId = req.params.errand_id;
-    const runnerId = req.user.id;
-    
-    // Get errand details
-    const [errand] = await pool.execute(
-      `SELECT * FROM errands WHERE id = ? AND runner_id = ? AND status ='in_progress'`,
-      [errandId, runnerId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or not in progress');
-    }
-    
-    // Escrow holds client_total (amount); runner receives runner_payout only
-    const row = errand[0];
-    const held = parseFloat(row.amount) || 0;
-    const payout = row.runner_payout != null ? parseFloat(row.runner_payout) : held;
-    const result = await releaseEscrowFunds(
-      row.client_id,
-      runnerId,
-      errandId,
-      held,
-      'USD',
-      { heldAmount: held, runnerPayout: payout }
-    );
-
-    await pool.execute(
-      `UPDATE errands SET status ='completed', completed_at = NOW() WHERE id = ?`,
-      [errandId]
-    );
-
-    jsonResponse(res, 200, true, result);
+    const errand = await transitionErrand(req.params.errand_id, 'completed', req.user);
+    jsonResponse(res, 200, true, { message: 'Errand completed; escrow release is processed separately', status: errand.status });
   } catch (error) {
-    jsonResponse(res, 500, false, null, error.message);
+    jsonResponse(res, error.status || 500, false, null, error.message);
   }
 });
 
@@ -411,9 +372,10 @@ router.get('/client', verifyToken, requireClient, async (req, res) => {
     const clientId = req.user.id;
     
     const [errands] = await pool.execute(
-      `SELECT e.*, r.name as runner_name 
+      `SELECT e.*, r.name as runner_name, h.status AS errand_hold_status
        FROM errands e 
        LEFT JOIN users r ON e.runner_id = r.id 
+       LEFT JOIN errand_holds h ON h.errand_id = e.id
        WHERE e.client_id = ? 
        ORDER BY e.created_at DESC`,
       [clientId]
@@ -428,12 +390,17 @@ router.get('/client', verifyToken, requireClient, async (req, res) => {
 // Get available errands for runners
 router.get('/available', verifyToken, requireRunner, async (req, res) => {
   try {
+    const [runnerRows] = await pool.execute('SELECT service_zones, areas_of_service FROM runners WHERE user_id = ?', [req.user.id]);
+    const runnerZones = String(runnerRows[0]?.service_zones || runnerRows[0]?.areas_of_service || '').split(',').map((z) => z.trim()).filter(Boolean);
+    const zoneCsv = runnerZones.join(',');
     const [errands] = await pool.execute(
       `SELECT e.*, u.name as client_name 
        FROM errands e 
        LEFT JOIN users u ON e.client_id = u.id 
-       WHERE e.runner_id IS NULL AND e.status = 'pending' AND e.payment_status = 'escrowed'
-       ORDER BY e.created_at DESC`
+       WHERE e.runner_id IS NULL AND e.status = 'paid' AND e.payment_status = 'escrowed'
+         AND (? = '' OR e.zone IS NULL OR FIND_IN_SET(REPLACE(e.zone, ' ', ''), REPLACE(?, ' ', '')) > 0)
+       ORDER BY CASE WHEN ? <> '' AND FIND_IN_SET(REPLACE(e.zone, ' ', ''), REPLACE(?, ' ', '')) > 0 THEN 0 ELSE 1 END, e.created_at DESC`,
+      [zoneCsv, zoneCsv, zoneCsv, zoneCsv]
     );
     
     jsonResponse(res, 200, true, { errands });
@@ -462,250 +429,199 @@ router.get('/runner', verifyToken, requireRunner, async (req, res) => {
   }
 });
 
-// Cancel errand
+// Cancel errand. Only paid/accepted-but-not-picked-up client cancellations are refundable in v1.
 router.patch('/cancel/:errand_id', verifyToken, async (req, res) => {
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-    
-    const errandId = req.params.errand_id;
-    const userId = req.user.id;
-    
-    // Get errand details
-    const [errand] = await connection.execute(
-      'SELECT * FROM errands WHERE id = ? AND (client_id = ? OR runner_id = ?)',
-      [errandId, userId, userId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or you are not authorized');
+    const [rows] = await pool.execute('SELECT * FROM errands WHERE id = ? AND client_id = ?', [req.params.errand_id, req.user.id]);
+    if (!rows.length) return jsonResponse(res, 404, false, null, 'Errand not found or you are not authorized');
+    const errand = rows[0];
+    const current = canonicalStatus(errand.status);
+    if (!['pending', 'paid', 'accepted'].includes(current)) {
+      return jsonResponse(res, 400, false, null, 'This errand cannot be cancelled at its current stage');
     }
-    
-    const errandData = errand[0];
-    
-    // Check if errand can be cancelled
-    if (errandData.status === 'completed') {
-      return jsonResponse(res, 400, false, null, 'Cannot cancel completed errand');
+    if (current === 'pending') {
+      await transitionErrand(errand.id, 'cancelled', req.user);
+      return jsonResponse(res, 200, true, { message: 'Errand cancelled successfully' });
     }
-    
-    // If payment was made, refund to client's spendable wallet
-    if (errandData.payment_status === 'escrowed') {
-      // Get client's wallets
-      const [escrowWallet] = await connection.execute(
-        `SELECT * FROM wallets WHERE user_id = ? AND wallet_type ='escrow' AND currency = 'USD'`,
-        [errandData.client_id]
-      );
-      
-      const [spendableWallet] = await connection.execute(
-        `SELECT * FROM wallets WHERE user_id = ? AND wallet_type ='spendable' AND currency = 'USD'`,
-        [errandData.client_id]
-      );
-      
-      if (escrowWallet.length > 0 && spendableWallet.length > 0) {
-        // Transfer from escrow back to spendable
-        await connection.execute(
-          'UPDATE wallets SET balance = balance - ? WHERE id = ?',
-          [errandData.amount, escrowWallet[0].id]
-        );
-        
-        await connection.execute(
-          'UPDATE wallets SET balance = balance + ? WHERE id = ?',
-          [errandData.amount, spendableWallet[0].id]
-        );
-        
-        // Record refund transaction
-        await connection.execute(
-          `INSERT INTO wallet_transactions (
-            from_wallet_id, to_wallet_id, transaction_type, amount, currency,
-            description, errand_id, status, processed_at
-          ) VALUES (?, ?, 'refund', ?, 'USD', ?, ?, 'completed', NOW())`,
-          [escrowWallet[0].id, spendableWallet[0].id, errandData.amount, 
-           `Refund for cancelled errand #${errandId}`, errandId]
-        );
-      }
-    }
-    
-    // Update errand status
-    await connection.execute(
-      `UPDATE errands SET status ='cancelled', cancelled_at = NOW() WHERE id = ?`,
-      [errandId]
-    );
-    
-    await connection.commit();
-    jsonResponse(res, 200, true, { message: 'Errand cancelled successfully' });
+    const result = await refundHold(errand.id, req.user.id, 'Client cancellation refund', { finalizeStatus: 'cancelled' });
+    jsonResponse(res, 200, true, { message: 'Errand cancelled and refunded', refund: result });
   } catch (error) {
-    await connection.rollback();
-    jsonResponse(res, 500, false, null, error.message);
-  } finally {
-    connection.release();
+    jsonResponse(res, error.status || 500, false, null, error.message);
   }
 });
 
-// Accept errand
+// Accept errand. Explicit agreement is required by the API.
 router.post('/:errand_id/accept', verifyToken, requireRunner, async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    
     const errandId = req.params.errand_id;
     const runnerId = req.user.id;
-
-    // Only verified runners can accept work. An admin acting through the
-    // runner role (requireRunner allows 'admin' too) skips this check —
-    // there's no runner profile row to check verification against.
+    if (req.body?.confirm_agreement !== true) {
+      await connection.rollback();
+      return jsonResponse(res, 400, false, null, 'You must explicitly agree to the runner terms before accepting');
+    }
     const role = req.user.userType || req.user.user_type || req.user.role;
     if (role !== 'admin') {
-      const [runnerRows] = await connection.execute(
-        'SELECT background_check_status FROM runners WHERE user_id = ?',
-        [runnerId]
+      const [[market]] = await pool.execute(
+        `SELECT id,require_verified_runners,insurance_mode FROM markets WHERE id=(SELECT market_id FROM errands WHERE id=? LIMIT 1)`,
+        [errandId]
       );
-      if (runnerRows[0]?.background_check_status !== 'approved') {
+      const requireVerified = market ? Boolean(market.require_verified_runners) : true;
+      const [runnerRows] = await connection.execute('SELECT verification_status, background_check_status FROM runners WHERE user_id = ?', [runnerId]);
+      const verificationStatus = runnerRows[0]?.verification_status || runnerRows[0]?.background_check_status || 'pending';
+      if (requireVerified && verificationStatus !== 'approved') {
         await connection.rollback();
-        return jsonResponse(res, 403, false, null, 'Your identity verification must be approved before you can accept errands. Submit a document under Verification in your dashboard.');
+        return jsonResponse(res, 403, false, null, 'Your verification must be approved before you can accept errands.');
       }
+      await assertPoliciesAccepted(runnerId, RUNNER_POLICIES);
+      if (market?.insurance_mode === 'ack_only') await assertLiabilityAccepted(runnerId, market.id, market.insurance_mode);
     }
-    
-    // Check if errand exists and is available
-    const [errand] = await connection.execute(
-      `SELECT * FROM errands WHERE id = ? AND runner_id IS NULL AND status ='pending' AND payment_status ='escrowed' FOR UPDATE`,
+    const [rows] = await connection.execute(
+      `SELECT * FROM errands WHERE id = ? AND runner_id IS NULL AND status IN ('paid','pending') AND payment_status = 'escrowed' FOR UPDATE`,
       [errandId]
     );
-    
-    if (errand.length === 0) {
+    if (!rows.length) {
       await connection.rollback();
       return jsonResponse(res, 404, false, null, 'Errand not found or not available');
     }
-    
-    // Assign errand to runner (row locked — prevents double accept)
-    const [upd] = await connection.execute(
-      `UPDATE errands SET runner_id = ?, status ='assigned', accepted_at = NOW() WHERE id = ? AND runner_id IS NULL`,
-      [runnerId, errandId]
-    );
-    if (upd.affectedRows === 0) {
-      await connection.rollback();
-      return jsonResponse(res, 409, false, null, 'Errand was just accepted by another runner');
-    }
-    
+    await connection.execute('UPDATE errands SET runner_id = ?, updated_at = NOW() WHERE id = ?', [runnerId, errandId]);
+    await transitionErrand(errandId, 'accepted', req.user, connection);
     await connection.commit();
-
-    await notifyUser({
-      userId: errand[0].client_id,
-      errandId: Number(errandId),
-      title: 'Runner assigned',
-      message: `A runner accepted your errand "${errand[0].title}"`,
-      type: 'success'
-    }, req.app.get('io'));
-
-    jsonResponse(res, 200, true, { message: 'Errand accepted successfully' });
+    await notifyUser({ userId: rows[0].client_id, errandId: Number(errandId), title: 'Runner assigned', message: `A runner accepted your errand "${rows[0].title}"`, type: 'success' }, req.app.get('io'));
+    jsonResponse(res, 200, true, { message: 'Errand accepted successfully', status: 'accepted' });
   } catch (error) {
     await connection.rollback();
-    jsonResponse(res, 500, false, null, error.message);
-  } finally {
-    connection.release();
+    jsonResponse(res, error.status || 500, false, null, error.message);
+  } finally { connection.release(); }
+});
+
+// Compatibility status endpoint. Canonical states are enforced by errandState; legacy names are mapped.
+router.put('/:errand_id/status', verifyToken, requireRunner, async (req, res) => {
+  try {
+    const requested = req.body?.status;
+    const mapped = { assigned: 'accepted', in_progress: 'picked_up', picked_up: 'picked_up', delivered: 'delivered', completed: 'completed' }[requested];
+    if (!mapped) return jsonResponse(res, 400, false, null, 'Invalid status');
+    if (mapped === 'accepted' && req.body?.confirm_agreement !== true) {
+      return jsonResponse(res, 400, false, null, 'Explicit agreement is required before accepting');
+    }
+    const errand = await transitionErrand(req.params.errand_id, mapped, req.user);
+    jsonResponse(res, 200, true, { message: `Errand status updated to ${errand.status}`, status: errand.status, fundsReleased: false });
+  } catch (error) {
+    jsonResponse(res, error.status || 500, false, null, error.message);
   }
 });
 
-// Update errand status
-router.put('/:errand_id/status', verifyToken, async (req, res) => {
+// Record an operational exception and open the existing dispute path; money movement remains in errandMoney.
+router.post('/:errand_id/exception', verifyToken, async (req, res) => {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    
-    const errandId = req.params.errand_id;
-    const { status } = req.body;
-    const userId = req.user.id;
-    
-    // Validate status
-    const validStatuses = ['assigned', 'in_progress', 'completed', 'cancelled'];
-    if (!validStatuses.includes(status)) {
-      return jsonResponse(res, 400, false, null, 'Invalid status');
+    const { exception_type, note } = req.body || {};
+    if (!['no_show', 'address_not_found'].includes(exception_type)) {
+      await connection.rollback();
+      return jsonResponse(res, 400, false, null, 'Invalid exception_type');
     }
-    
-    // Check if user is the runner of this errand
-    const [errand] = await connection.execute(
-      'SELECT * FROM errands WHERE id = ? AND runner_id = ?',
-      [errandId, userId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or not assigned to you');
+    const [rows] = await connection.execute('SELECT * FROM errands WHERE id = ? AND (client_id = ? OR runner_id = ?) FOR UPDATE', [req.params.errand_id, req.user.id, req.user.id]);
+    if (!rows.length) { await connection.rollback(); return jsonResponse(res, 404, false, null, 'Errand not found or access denied'); }
+    const errand = rows[0];
+    const current = canonicalStatus(errand.status);
+    if (!['accepted', 'picked_up', 'delivered', 'completed'].includes(current)) {
+      await connection.rollback(); return jsonResponse(res, 409, false, null, 'This exception is not available at the current stage');
     }
-    
-    const errandData = errand[0];
-    
-    // Update status
-    let updateQuery = 'UPDATE errands SET status = ? WHERE id = ?';
-    let params = [status, errandId];
-    
-    if (status === 'in_progress') {
-      updateQuery = 'UPDATE errands SET status = ?, started_at = NOW() WHERE id = ?';
-    } else if (status === 'completed') {
-      updateQuery = `UPDATE errands SET status = ?, completed_at = NOW(), payment_status = 'released' WHERE id = ?`;
-      
-      // Release escrow funds to runner using centralized utility function
-      if (errandData.payment_status === 'escrowed') {
-        // Temporarily commit transaction to allow utility function to work
-        await connection.commit();
-        
-        try {
-          {
-            const held = parseFloat(errandData.amount) || 0;
-            const payout = errandData.runner_payout != null ? parseFloat(errandData.runner_payout) : held;
-            await releaseEscrowFunds(
-              errandData.client_id,
-              userId,
-              errandId,
-              held,
-              'USD',
-              { heldAmount: held, runnerPayout: payout }
-            );
-            console.log(`✅ FUNDS RELEASED: runner_payout=${payout} (held=${held}) to runner ${userId} for errand ${errandId}`);
-          }
-        } catch (escrowError) {
-          console.error('❌ ERROR releasing escrow funds:', escrowError);
-          // Continue with status update even if escrow release fails
-        }
-        
-        // Start new transaction for status update
-        await connection.beginTransaction();
-      }
-    }
-    
-    await connection.execute(updateQuery, params);
+    const [open] = await connection.execute(`SELECT id FROM errand_disputes WHERE errand_id = ? AND status = 'open' FOR UPDATE`, [errand.id]);
+    if (open.length) { await connection.rollback(); return jsonResponse(res, 409, false, null, 'An open dispute already exists'); }
+    await connection.execute('UPDATE errands SET exception_type = ?, had_address_issue = CASE WHEN ? = \'address_not_found\' THEN 1 ELSE had_address_issue END, updated_at=NOW() WHERE id=?', [exception_type, exception_type, errand.id]);
+    await connection.execute(`INSERT INTO errand_disputes (errand_id, opened_by, reason_code, note, status) VALUES (?, ?, ?, ?, 'open')`, [errand.id, req.user.id, exception_type, note || exception_type]);
+    await transitionErrand(errand.id, 'disputed', req.user, connection);
     await connection.commit();
-
-    if (status === 'in_progress') {
-      await notifyUser({
-        userId: errandData.client_id,
-        errandId: Number(errandId),
-        title: 'Errand in progress',
-        message: `Your runner has started "${errandData.title}"`,
-        type: 'info'
-      }, req.app.get('io'));
-    } else if (status === 'completed') {
-      await notifyUser({
-        userId: errandData.client_id,
-        errandId: Number(errandId),
-        title: 'Errand completed',
-        message: `"${errandData.title}" is complete. Tap to rate your runner.`,
-        type: 'success'
-      }, req.app.get('io'));
-    }
-    
-    jsonResponse(res, 200, true, { 
-      message: `Errand status updated to ${status}`,
-      fundsReleased: status === 'completed' && errandData.payment_status === 'escrowed'
-    });
-  } catch (error) {
-    await connection.rollback();
-    console.error('❌ ERROR in status update:', error);
-    jsonResponse(res, 500, false, null, error.message);
-  } finally {
-    connection.release();
-  }
+    jsonResponse(res, 201, true, { message: `${exception_type} recorded; dispute opened and money remains frozen`, exception_type });
+  } catch (error) { await connection.rollback(); jsonResponse(res, error.status || 500, false, null, error.message); }
+  finally { connection.release(); }
 });
 
-// Update errand progress with file uploads
+// Open a service dispute. Money remains frozen while the dispute is open.
+router.post('/:errand_id/dispute', verifyToken, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const { reason_code, note } = req.body || {};
+    if (!reason_code || !note) {
+      await connection.rollback();
+      return jsonResponse(res, 400, false, null, 'reason_code and note are required');
+    }
+    const [rows] = await connection.execute('SELECT * FROM errands WHERE id = ? AND (client_id = ? OR runner_id = ?) FOR UPDATE', [req.params.errand_id, req.user.id, req.user.id]);
+    if (!rows.length) { await connection.rollback(); return jsonResponse(res, 404, false, null, 'Errand not found or access denied'); }
+    const errand = rows[0];
+    const current = canonicalStatus(errand.status);
+    if (!['accepted','picked_up','delivered','completed'].includes(current)) {
+      await connection.rollback();
+      return jsonResponse(res, 409, false, null, 'This errand is not in a dispute-eligible state');
+    }
+    if (current === 'completed' && (!errand.completed_at || Date.now() - new Date(errand.completed_at).getTime() > DISPUTE_WINDOW_HOURS * 60 * 60 * 1000)) {
+      await connection.rollback();
+      return jsonResponse(res, 409, false, null, 'Dispute window has expired');
+    }
+    const [open] = await connection.execute(`SELECT id FROM errand_disputes WHERE errand_id = ? AND status = 'open' FOR UPDATE`, [errand.id]);
+    if (open.length) { await connection.rollback(); return jsonResponse(res, 409, false, null, 'An open dispute already exists'); }
+    await connection.execute(`INSERT INTO errand_disputes (errand_id, opened_by, reason_code, note, status) VALUES (?, ?, ?, ?, 'open')`, [errand.id, req.user.id, reason_code, note]);
+    await transitionErrand(errand.id, 'disputed', req.user, connection);
+    await connection.commit();
+    jsonResponse(res, 201, true, { message: 'Dispute opened; money processing is frozen' });
+  } catch (error) {
+    await connection.rollback();
+    jsonResponse(res, error.status || 500, false, null, error.message);
+  } finally { connection.release(); }
+});
+
+// Admin dispute resolution. All money movement goes through errandMoney.
+router.post('/:errand_id/dispute/resolve', verifyToken, requireAdmin, async (req, res) => {
+  const connection = await pool.getConnection();
+  try {
+    const { resolution_code, note } = req.body || {};
+    if (!['release_to_runner','refund_to_client','cancel_no_pay'].includes(resolution_code)) return jsonResponse(res, 400, false, null, 'Invalid resolution_code');
+    const [rows] = await connection.execute(`SELECT * FROM errand_disputes WHERE errand_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1`, [req.params.errand_id]);
+    if (!rows.length) return jsonResponse(res, 404, false, null, 'Open dispute not found');
+
+    let moneyResult = null;
+    if (resolution_code === 'release_to_runner') moneyResult = await releaseHold(req.params.errand_id, req.user.id, 'Admin resolution: release_to_runner', { finalizeStatus: 'completed' });
+    if (resolution_code === 'refund_to_client') moneyResult = await refundHold(req.params.errand_id, req.user.id, 'Admin resolution: refund_to_client', { finalizeStatus: 'cancelled' });
+
+    const [errands] = await pool.execute('SELECT * FROM errands WHERE id = ?', [req.params.errand_id]);
+    const errand = errands[0];
+    if (!errand) return jsonResponse(res, 404, false, null, 'Errand not found');
+    if (resolution_code === 'cancel_no_pay') {
+      if (errand.payment_status === 'escrowed') moneyResult = await refundHold(errand.id, req.user.id, 'Admin resolution: cancel_no_pay', { finalizeStatus: 'cancelled' });
+      else await transitionErrand(errand.id, 'cancelled', req.user);
+    } else if (resolution_code === 'release_to_runner' || resolution_code === 'refund_to_client') {
+      // The money engine finalized the terminal errand state atomically.
+    }
+    await pool.execute(`UPDATE errand_disputes SET status = 'resolved', resolution_code = ?, resolution_note = ?, resolved_by = ?, resolved_at = NOW() WHERE id = ?`, [resolution_code, note || '', req.user.id, rows[0].id]);
+    try {
+      await enqueueEventAfterCommit({ eventType: 'resolved', errandId: errand.id, payload: {
+        type: 'resolved', errand_id: errand.id, status: errand.status, reference: errand.business_reference || null,
+        market_id: errand.market_id || null, zone: errand.zone || null, client_id: errand.client_id, runner_id: errand.runner_id || null, actor_id: req.user.id,
+        resolution_code, resolution_note: note || '', resolved_at: new Date().toISOString(),
+        timestamps: { paid_at: errand.paid_at || null, accepted_at: errand.accepted_at || null, picked_up_at: errand.picked_up_at || null, delivered_at: errand.delivered_at || null, completed_at: errand.completed_at || null, cancelled_at: errand.cancelled_at || null, disputed_at: errand.disputed_at || null }
+      }});
+    } catch (eventError) { console.error('[EVENT OUTBOX] resolve event enqueue failed:', eventError.message); }
+    await auditSecurity({actorId:req.user.id,action:'money_resolution',targetType:'errand',targetId:Number(req.params.errand_id),details:{resolution_code,note:note||null},req});
+    jsonResponse(res, 200, true, { message: 'Dispute resolved', resolution_code, money: moneyResult });
+  } catch (error) {
+    jsonResponse(res, error.status || 500, false, null, error.message);
+  } finally { connection.release(); }
+});
+
+// Lightweight due-money processor; safe to invoke repeatedly.
+router.post('/process-due-money', verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const releases = await processDueReleases();
+    const refunds = await processDueRefunds();
+    jsonResponse(res, 200, true, { releases, refunds });
+  } catch (error) { jsonResponse(res, 500, false, null, error.message); }
+});
+
+// Update errand progress with file uploads. Status changes use errandState only.
 router.post('/update-progress', verifyToken, upload.fields([
   { name: 'images', maxCount: 5 },
   { name: 'videos', maxCount: 3 },
@@ -713,107 +629,35 @@ router.post('/update-progress', verifyToken, upload.fields([
 ]), async (req, res) => {
   const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
-    
     const { errandId, status, notes } = req.body;
     const userId = req.user.id;
-    
-    // Verify the errand belongs to this runner
-    const [errand] = await connection.execute(
-      'SELECT * FROM errands WHERE id = ? AND runner_id = ?',
-      [errandId, userId]
-    );
-    
-    if (errand.length === 0) {
-      return jsonResponse(res, 404, false, null, 'Errand not found or not assigned to you');
+    const [rows] = await connection.execute('SELECT * FROM errands WHERE id = ? AND runner_id = ?', [errandId, userId]);
+    if (!rows.length) return jsonResponse(res, 404, false, null, 'Errand not found or not assigned to you');
+    let finalStatus = canonicalStatus(rows[0].status);
+    if (status && status !== rows[0].status) {
+      const mapped = { assigned: 'accepted', in_progress: 'picked_up', picked_up: 'picked_up', delivered: 'delivered', completed: 'completed' }[status];
+      if (!mapped) return jsonResponse(res, 400, false, null, 'Invalid status');
+      const updated = await transitionErrand(errandId, mapped, req.user);
+      finalStatus = updated.status;
     }
-    
-    // Update errand status if provided
-    if (status && status !== errand[0].status) {
-      const errandData = errand[0];
-      let updateQuery = 'UPDATE errands SET status = ? WHERE id = ?';
-      let params = [status, errandId];
-      
-      if (status === 'in_progress') {
-        updateQuery = 'UPDATE errands SET status = ?, started_at = NOW() WHERE id = ?';
-      } else if (status === 'completed') {
-        updateQuery = `UPDATE errands SET status = ?, completed_at = NOW(), payment_status = 'released' WHERE id = ?`;
-        
-        // Release escrow funds to runner using centralized utility function
-        if (errandData.payment_status === 'escrowed') {
-          // Temporarily commit transaction to allow utility function to work
-          await connection.commit();
-          
-          try {
-            {
-              const held = parseFloat(errandData.amount) || 0;
-              const payout = errandData.runner_payout != null ? parseFloat(errandData.runner_payout) : held;
-              await releaseEscrowFunds(
-                errandData.client_id,
-                userId,
-                errandId,
-                held,
-                'USD',
-                { heldAmount: held, runnerPayout: payout }
-              );
-              console.log(`✅ FUNDS RELEASED (Progress): runner_payout=${payout} (held=${held}) to runner ${userId} for errand ${errandId}`);
-            }
-          } catch (escrowError) {
-            console.error('❌ ERROR releasing escrow funds:', escrowError);
-            // Continue with status update even if escrow release fails
-          }
-          
-          // Start new transaction for remaining operations
-          await connection.beginTransaction();
-        }
-      }
-      
-      await connection.execute(updateQuery, params);
-    }
-    
-    // Create progress update record
-    const [progressResult] = await connection.execute(
-      'INSERT INTO errand_progress (errand_id, runner_id, notes, created_at) VALUES (?, ?, ?, NOW())',
-      [errandId, userId, notes || '']
-    );
-    
+
+    await connection.beginTransaction();
+    const [progressResult] = await connection.execute('INSERT INTO errand_progress (errand_id, runner_id, notes, created_at) VALUES (?, ?, ?, NOW())', [errandId, userId, notes || '']);
     const progressId = progressResult.insertId;
-    
-    // Handle file uploads
     if (req.files) {
-      const fileTypes = ['images', 'videos', 'documents'];
-      
-      for (const type of fileTypes) {
-        if (req.files[type]) {
-          for (const file of req.files[type]) {
-            await connection.execute(
-              'INSERT INTO errand_files (progress_id, errand_id, file_type, file_name, file_path, file_size, mime_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())',
-              [progressId, errandId, type.slice(0, -1), file.originalname, file.path, file.size, file.mimetype]
-            );
-          }
+      for (const type of ['images','videos','documents']) {
+        for (const file of (req.files[type] || [])) {
+          await connection.execute('INSERT INTO errand_files (progress_id, errand_id, file_type, file_name, file_path, file_size, mime_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())', [progressId, errandId, type.slice(0, -1), file.originalname, file.path, file.size, file.mimetype]);
         }
       }
     }
-    
     await connection.commit();
-    jsonResponse(res, 200, true, { message: 'Progress updated successfully', progressId });
+    jsonResponse(res, 200, true, { message: 'Progress updated successfully', progressId, status: finalStatus });
   } catch (error) {
     await connection.rollback();
-    
-    // Clean up uploaded files if database operation failed
-    if (req.files) {
-      const allFiles = Object.values(req.files).flat();
-      allFiles.forEach(file => {
-        if (fs.existsSync(file.path)) {
-          fs.unlinkSync(file.path);
-        }
-      });
-    }
-    
-    jsonResponse(res, 500, false, null, error.message);
-  } finally {
-    connection.release();
-  }
+    if (req.files) Object.values(req.files).flat().forEach(file => { if (fs.existsSync(file.path)) fs.unlinkSync(file.path); });
+    jsonResponse(res, error.status || 500, false, null, error.message);
+  } finally { connection.release(); }
 });
 
 // Get errand progress history
